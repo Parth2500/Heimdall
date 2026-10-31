@@ -31,7 +31,7 @@ grant_type=client_credentials
 
 Rules:
 
-- Authenticate with HTTP Basic. A public client cannot use this grant.
+- Authenticate with HTTP Basic or with a private key. A public client cannot use this grant.
 - Do not ask for user scopes: `openid`, `profile`, `email`, `address`, `phone`, or `offline_access`. There is no user, so Heimdall refuses them with `invalid_scope`.
 - Each scope must be registered for your client. Heimdall refuses the whole request if one scope is not. It does not reduce the scope.
 

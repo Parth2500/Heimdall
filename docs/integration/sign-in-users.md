@@ -144,7 +144,7 @@ Rules for the request:
 
 - Send the same `redirect_uri` that you sent to `/authorize`. You can leave it out only if your client has one registered URI.
 - Do not put parameters in the query string. Heimdall refuses it, because proxies and logs keep query strings.
-- Do not send `client_secret` in the body. Heimdall supports `client_secret_basic` only.
+- Do not send `client_secret` in the body. Heimdall supports `client_secret_basic` and `private_key_jwt`, not `client_secret_post`. See [Authenticate with a private key](private-key-jwt.md).
 - For HTTP Basic, form-urlencode the client ID and secret first, then join them with `:`, then base64-encode the result (RFC 6749, section 2.3.1).
 
 ### Choose the audience

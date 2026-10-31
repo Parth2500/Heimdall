@@ -504,3 +504,6 @@ src/Heimdall.Api/wwwroot/account/
 
 # Stryker.NET mutation reports
 StrykerOutput/
+
+# graphify knowledge graph output
+graphify-out/

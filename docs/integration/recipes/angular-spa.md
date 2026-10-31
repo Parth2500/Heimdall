@@ -180,16 +180,20 @@ export class AuthActions {
   async signOut(): Promise<void> {
     try {
       // Revokes the refresh token family at Heimdall (RFC 7009).
+      // Do this first, so the family ends even if the user does not confirm the sign-out.
       await firstValueFrom(this.oidc.revokeRefreshToken());
-    } finally {
-      // Heimdall has no end_session_endpoint yet, so end the session in the app only.
-      this.oidc.logoffLocal();
+    } catch {
+      // The sign-out at Heimdall revokes the family too.
     }
+    // Sends the browser to the end_session_endpoint with id_token_hint and post_logout_redirect_uri.
+    await firstValueFrom(this.oidc.logoff());
   }
 }
 ```
 
-Do not call `logoff()`. It needs an `end_session_endpoint`, which Heimdall does not have yet. See [Sign out](../sign-out.md).
+`logoff()` reads `end_session_endpoint` from discovery. Heimdall ends its session and every token family of that session. Then it sends the browser to `postLogoutRedirectUri`. Register that URI in `post_logout_redirect_uris`, by exact match. See [Sign out](../sign-out.md).
+
+`logoffLocal()` ends the session in the app only. The Heimdall session stays valid, so the next `authorize()` signs the user in with no login page.
 
 ## After a page reload
 

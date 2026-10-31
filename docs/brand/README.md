@@ -16,7 +16,7 @@ Ledger card (decision U16, 2026-10-25; it replaced Burning Bridge, U15). Heimdal
 - **Tile:** square, no radius (**The Square Corner Rule** covers the logo too).
 - **On a page:** the eye at 32px, 12px before the wordmark "Heimdall", at the top left of the card. A client never carries the eye: it is not Heimdall.
 - **In code:** `HdCard` (ui-kit) draws the eye inline in `currentColor`, so it follows the display color in both themes. A tenant colour change needs no new SVG.
-- **Colours:** lapis and white only, or one ink. Never red: red means a refusal. Never red, which means a refusal.
+- **Colours:** lapis and white only, or one ink. Never red: red means a refusal.
 - **Minimum size:** 16px. The keyhole drops out below that; use the mark at 16px or larger.
 - **Never** round the tile, add a gradient, glow or shadow, or put the eye on a client's band or plate.
 
