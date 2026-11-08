@@ -31,7 +31,7 @@
     "oidc-client-ts": "3.5.0",
     "prettier": "^3.8.1",
     "typescript": "~6.0.2",
-    "undici": "8.12.3",
+    "undici": "8.12.4",
     "vitest": "^5.0.0"
   },
   "engines": {
