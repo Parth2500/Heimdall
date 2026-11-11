@@ -145,11 +145,11 @@ public class ConsentServiceTests
     {
         var result = await _service.GetPromptAsync(Context, _request.Id.ToString(), sessionId, CancellationToken.None);
 
-        AssertError(result, ConsentService.LoginRequiredCode, "no session");
+        AssertError(result, ConsentService.LoginRequiredCode, "no session that satisfies the request");
         AssertError(
             await _service.DecideAsync(Context, _request.Id.ToString(), sessionId, true, CancellationToken.None),
             ConsentService.LoginRequiredCode,
-            "no session");
+            "no session that satisfies the request");
         Assert.Null(_request.ConsentDecisionOf(_user.Id));
     }
 
@@ -193,7 +193,7 @@ public class ConsentServiceTests
         AssertError(
             await Decide(approve: true, request.Id.ToString()),
             ConsentService.LoginRequiredCode,
-            "session does not satisfy the request");
+            "no session that satisfies the request");
         Assert.Null(request.ConsentDecisionOf(_user.Id));
 
         _time.Advance(TimeSpan.FromSeconds(1));

@@ -222,6 +222,7 @@ The paths of the account pages. Keep the defaults unless the pages move.
 |---|---|
 | `LoginPath` | `/account/login` |
 | `ConsentPath` | `/account/consent` |
+| `SelectAccountPath` | `/account/select-account` |
 | `ErrorPath` | `/account/error` |
 | `LogoutPath` | `/account/logout` |
 | `SignedOutPath` | `/account/signed-out` |

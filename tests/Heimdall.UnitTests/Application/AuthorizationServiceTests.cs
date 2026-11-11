@@ -29,6 +29,7 @@ public class AuthorizationServiceTests
     private readonly InMemoryUserStore _users;
     private readonly InMemorySessionStore _sessions;
     private readonly RecordingAuditLog _audit = new();
+    private readonly FakeIdTokenHintValidator _hints = new();
     private readonly AuthorizationService _service;
     private readonly Client _spa;
     private readonly User _user;
@@ -40,7 +41,7 @@ public class AuthorizationServiceTests
         var authenticator = new UserAuthenticator(
             _users, new FakePasswordHasher(), new InMemoryLoginThrottleStore(), new LoginThrottleOptions(), _audit, _time);
         var sessions = new SessionService(authenticator, _sessions, _audit, _time);
-        _service = new AuthorizationService(_clients, _store, sessions, _audit, _time);
+        _service = new AuthorizationService(_clients, _store, sessions, _hints, _audit, _time);
         _spa = AddClient("spa");
         _user = User.Create(Guid.CreateVersion7(), _tenant.Id, "alice@example.com", "hash", Now.AddDays(-1));
         _users.Add(_user);
@@ -72,12 +73,33 @@ public class AuthorizationServiceTests
     }
 
     /// <summary>A session that signed in at <paramref name="authTime"/>. Returns the cookie value.</summary>
-    private string SignedIn(DateTimeOffset? authTime = null, User? user = null)
+    private string SignedIn(DateTimeOffset? authTime = null, User? user = null, string sid = "sid-for-tests-00000000")
     {
         var id = Base64Url.EncodeToString(Guid.NewGuid().ToByteArray().Concat(Guid.NewGuid().ToByteArray()).ToArray());
-        _sessions.Add(Session.Start(TokenHash.Compute(id), "sid-for-tests-00000000", _tenant.Id, (user ?? _user).Id, TimeSpan.FromHours(12), authTime ?? Now));
+        _sessions.Add(Session.Start(TokenHash.Compute(id), sid, _tenant.Id, (user ?? _user).Id, TimeSpan.FromHours(12), authTime ?? Now));
         return id;
     }
+
+    private const string BobSid = "sid-of-bob-00000000000";
+
+    private User AddBob()
+    {
+        var bob = User.Create(Guid.CreateVersion7(), _tenant.Id, "bob@example.com", "hash", Now.AddDays(-1));
+        _users.Add(bob);
+        return bob;
+    }
+
+    /// <summary>Alice and Bob in one browser. Returns the cookie value and Bob.</summary>
+    private (string Cookie, User Bob) TwoAccounts()
+    {
+        var bob = AddBob();
+        return (SignedIn() + "." + SignedIn(user: bob, sid: BobSid), bob);
+    }
+
+    private void RegisterHint(string token, User user, string audience = "spa", string issuer = Issuer) =>
+        _hints.Hints[token] = new Heimdall.Application.Logout.VerifiedIdTokenHint(issuer, user.Id.ToString(), [audience], "sid-for-tests-00000000");
+
+    private Guid CodeUser() => Assert.Single(_store.Codes).UserId;
 
     private static Dictionary<string, string> Valid(params (string Name, string? Value)[] changes)
     {
@@ -605,7 +627,6 @@ public class AuthorizationServiceTests
     }
 
     [Theory]
-    [InlineData("select_account")] // Needs the account picker (#41).
     [InlineData("login login")]
     [InlineData("consent unknown")]
     public async Task Unsupported_or_repeated_prompt_is_refused(string prompt)
@@ -1012,5 +1033,464 @@ public class AuthorizationServiceTests
         AssertPage(await Resume(request.RequestId.ToString(), SignedIn()), OAuthError.InvalidRequestCode, "request already used");
         Assert.Empty(_store.Codes);
         Assert.Empty(_audit.Events);
+    }
+
+    // ---- The account choice (#41, D51 to D53)
+
+    [Fact]
+    public async Task One_live_session_and_no_hint_gets_the_code()
+    {
+        Assert.IsType<AuthorizeRedirect>(await Authorize(Valid(), SignedIn()));
+        Assert.Equal(_user.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Several_live_sessions_and_no_hint_show_the_picker()
+    {
+        var (cookie, _) = TwoAccounts();
+
+        var outcome = await Authorize(Valid(), cookie);
+
+        var picker = Assert.IsType<AuthorizeSelectAccount>(outcome);
+        Assert.Equal(Assert.Single(_store.Requests).Id, picker.RequestId);
+        Assert.Empty(_store.Codes);
+    }
+
+    [Fact]
+    public async Task Prompt_none_with_several_live_sessions_is_account_selection_required()
+    {
+        var (cookie, _) = TwoAccounts();
+
+        var outcome = await Authorize(Valid(("prompt", "none")), cookie);
+
+        AssertErrorRedirect(outcome, "account_selection_required", "prompt=none with several accounts and no hint");
+        Assert.Empty(_store.Requests);
+    }
+
+    [Fact]
+    public async Task One_ended_session_and_no_live_one_show_the_picker()
+    {
+        var cookie = SignedIn();
+        _sessions.Sessions[0].Revoke(Now);
+
+        Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+    }
+
+    [Fact]
+    public async Task One_live_session_beside_an_ended_one_shows_the_picker()
+    {
+        var (cookie, _) = TwoAccounts();
+        _sessions.Sessions[0].Revoke(Now);
+
+        Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+    }
+
+    [Fact]
+    public async Task Selection_chooses_the_account_of_the_code()
+    {
+        var (cookie, _) = TwoAccounts();
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+
+        var selected = await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, "sid-for-tests-00000000", CancellationToken.None);
+        var outcome = await Resume(picker.RequestId.ToString(), cookie);
+
+        Assert.True(selected.IsSuccess);
+        Assert.IsType<AuthorizeRedirect>(outcome);
+        Assert.Equal(_user.Id, CodeUser());
+        var audit = _audit.Events.Single(e => e.Type == AuditEventTypes.AccountSelected);
+        Assert.Equal(_user.Id, audit.SubjectUserId);
+        Assert.Equal("sid-for-tests-00000000", audit.Data["sid"]);
+        Assert.Equal(picker.RequestId.ToString(), audit.Data["request_id"]);
+    }
+
+    [Fact]
+    public async Task Later_selection_replaces_the_earlier_one()
+    {
+        var (cookie, bob) = TwoAccounts();
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+        await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, "sid-for-tests-00000000", CancellationToken.None);
+        await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, BobSid, CancellationToken.None);
+
+        await Resume(picker.RequestId.ToString(), cookie);
+
+        Assert.Equal(bob.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Selection_of_a_session_outside_the_list_is_refused()
+    {
+        // D52: the sid only selects inside the list that the cookie authenticated. Bob's session is live, but this
+        // browser does not hold it.
+        var bob = AddBob();
+        SignedIn(user: bob, sid: BobSid);
+        var cookie = SignedIn();
+        var login = Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("prompt", "login")), cookie));
+
+        var selected = await _service.SelectAsync(Context, login.RequestId.ToString(), cookie, BobSid, CancellationToken.None);
+
+        Assert.False(selected.IsSuccess);
+        Assert.Null(_store.Requests[0].SelectedSid);
+        Assert.DoesNotContain(_audit.Events, e => e.Type == AuditEventTypes.AccountSelected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("not-a-sid")]
+    public async Task Selection_without_a_listed_sid_is_refused(string? sid)
+    {
+        var (cookie, _) = TwoAccounts();
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+
+        Assert.False((await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, sid, CancellationToken.None)).IsSuccess);
+    }
+
+    [Fact]
+    public async Task Selection_of_an_ended_session_is_refused()
+    {
+        var (cookie, _) = TwoAccounts();
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+        _sessions.Sessions[1].Revoke(Now);
+
+        Assert.False((await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, BobSid, CancellationToken.None)).IsSuccess);
+    }
+
+    [Theory]
+    [InlineData("not-a-guid")]
+    [InlineData("0198c2a0-0000-7000-8000-000000000000")]
+    public async Task Selection_for_an_unknown_request_is_refused(string requestId)
+    {
+        var (cookie, _) = TwoAccounts();
+
+        Assert.False((await _service.SelectAsync(Context, requestId, cookie, BobSid, CancellationToken.None)).IsSuccess);
+    }
+
+    [Fact]
+    public async Task Selection_for_an_expired_request_is_refused()
+    {
+        var (cookie, _) = TwoAccounts();
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+        _time.Advance(AuthorizationRequest.Lifetime);
+
+        Assert.False((await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, BobSid, CancellationToken.None)).IsSuccess);
+    }
+
+    [Fact]
+    public async Task Selected_session_that_ended_before_the_resume_does_not_count()
+    {
+        var (cookie, _) = TwoAccounts();
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+        await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, BobSid, CancellationToken.None);
+        _sessions.Sessions[1].Revoke(Now);
+
+        // Alice is the one live session now, but one ended account is in the list, so the user chooses again.
+        Assert.IsType<AuthorizeSelectAccount>(await Resume(picker.RequestId.ToString(), cookie));
+        Assert.Empty(_store.Codes);
+    }
+
+    [Fact]
+    public async Task Selected_session_that_left_the_cookie_does_not_count()
+    {
+        var bob = AddBob();
+        var alice = SignedIn();
+        var bobId = SignedIn(user: bob, sid: BobSid);
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), alice + "." + bobId));
+        await _service.SelectAsync(Context, picker.RequestId.ToString(), alice + "." + bobId, BobSid, CancellationToken.None);
+
+        // Another browser holds only Alice's session and resumes the request.
+        Assert.IsType<AuthorizeRedirect>(await Resume(picker.RequestId.ToString(), alice));
+        Assert.Equal(_user.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Prompt_select_account_shows_the_picker_with_one_live_session()
+    {
+        var cookie = SignedIn();
+
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(("prompt", "select_account")), cookie));
+        Assert.True(_store.Requests[0].SelectAccount);
+
+        // Only a selection for this request satisfies it.
+        Assert.IsType<AuthorizeSelectAccount>(await Resume(picker.RequestId.ToString(), cookie));
+        await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, "sid-for-tests-00000000", CancellationToken.None);
+        Assert.IsType<AuthorizeRedirect>(await Resume(picker.RequestId.ToString(), cookie));
+    }
+
+    [Fact]
+    public async Task Prompt_select_account_ignores_the_hints()
+    {
+        var (cookie, bob) = TwoAccounts();
+        RegisterHint("hint", bob);
+
+        var outcome = await Authorize(Valid(("prompt", "select_account"), ("id_token_hint", "hint"), ("login_hint", "bob@example.com")), cookie);
+
+        Assert.IsType<AuthorizeSelectAccount>(outcome);
+    }
+
+    [Fact]
+    public async Task Prompt_select_account_without_a_session_shows_the_sign_in_page()
+    {
+        Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("prompt", "select_account"))));
+    }
+
+    [Fact]
+    public async Task Prompt_none_with_select_account_is_refused()
+    {
+        AssertErrorRedirect(await Authorize(Valid(("prompt", "none select_account"))), OAuthError.InvalidRequestCode, "prompt=none with another value");
+    }
+
+    [Fact]
+    public async Task Login_hint_chooses_the_live_session_of_that_user()
+    {
+        var (cookie, bob) = TwoAccounts();
+
+        Assert.IsType<AuthorizeRedirect>(await Authorize(Valid(("login_hint", " Bob@Example.com ")), cookie));
+        Assert.Equal(bob.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Login_hint_works_with_prompt_none()
+    {
+        var (cookie, _) = TwoAccounts();
+
+        Assert.IsType<AuthorizeRedirect>(await Authorize(Valid(("login_hint", "alice@example.com"), ("prompt", "none")), cookie));
+        Assert.Equal(_user.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Login_hint_without_a_live_session_shows_the_sign_in_page_and_is_stored()
+    {
+        var (cookie, _) = TwoAccounts();
+
+        Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("login_hint", "carol@example.com")), cookie));
+        Assert.Equal("carol@example.com", _store.Requests[0].LoginHint);
+    }
+
+    [Fact]
+    public async Task Login_hint_without_a_live_session_and_prompt_none_is_login_required()
+    {
+        var (cookie, _) = TwoAccounts();
+
+        var outcome = await Authorize(Valid(("login_hint", "carol@example.com"), ("prompt", "none")), cookie);
+
+        // The same answer for an unknown account and for an account that is not signed in (D53).
+        AssertErrorRedirect(outcome, "login_required", "prompt=none without a usable session");
+    }
+
+    [Theory]
+    [InlineData("not an email")]
+    [InlineData("alice")]
+    [InlineData("@example.com")]
+    [InlineData("alice@")]
+    [InlineData("a@b@c")]
+    [InlineData("alice @example.com")]
+    public async Task Login_hint_that_is_no_email_address_is_ignored(string hint)
+    {
+        Assert.IsType<AuthorizeRedirect>(await Authorize(Valid(("login_hint", hint)), SignedIn()));
+    }
+
+    [Fact]
+    public async Task Login_hint_longer_than_an_email_address_is_ignored()
+    {
+        var hint = new string('a', 250) + "@b.io";
+
+        Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("login_hint", hint))));
+        Assert.Null(_store.Requests[0].LoginHint);
+        Assert.Equal(254, AuthorizationRequest.MaxLoginHintLength);
+        Assert.True(AuthorizationRequest.IsLoginHint(new string('a', 249) + "@b.io"));
+    }
+
+    [Fact]
+    public async Task Id_token_hint_chooses_the_live_session_of_that_user()
+    {
+        var (cookie, bob) = TwoAccounts();
+        RegisterHint("hint", bob);
+
+        Assert.IsType<AuthorizeRedirect>(await Authorize(Valid(("id_token_hint", "hint"), ("prompt", "none")), cookie));
+        Assert.Equal(bob.Id, CodeUser());
+        Assert.Equal((_tenant.Id, "hint"), Assert.Single(_hints.Checked));
+    }
+
+    [Fact]
+    public async Task Id_token_hint_wins_over_login_hint()
+    {
+        var (cookie, _) = TwoAccounts();
+        RegisterHint("hint", _user);
+
+        await Authorize(Valid(("id_token_hint", "hint"), ("login_hint", "bob@example.com")), cookie);
+
+        Assert.Equal(_user.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Id_token_hint_of_a_user_without_a_live_session_never_gives_another_account()
+    {
+        var bob = AddBob();
+        RegisterHint("hint", bob);
+        var cookie = SignedIn();
+
+        AssertErrorRedirect(
+            await Authorize(Valid(("id_token_hint", "hint"), ("prompt", "none")), cookie),
+            "login_required",
+            "prompt=none without a usable session");
+        Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("id_token_hint", "hint")), cookie));
+        Assert.Equal(bob.Id, _store.Requests[0].HintUserId);
+        Assert.Empty(_store.Codes);
+    }
+
+    [Fact]
+    public async Task Id_token_hint_that_heimdall_cannot_verify_is_refused()
+    {
+        AssertErrorRedirect(
+            await Authorize(Valid(("id_token_hint", "forged")), SignedIn()),
+            OAuthError.InvalidRequestCode,
+            "id_token_hint not valid for this client");
+    }
+
+    [Fact]
+    public async Task Id_token_hint_of_another_client_is_refused()
+    {
+        RegisterHint("hint", _user, audience: "other");
+
+        AssertErrorRedirect(
+            await Authorize(Valid(("id_token_hint", "hint")), SignedIn()),
+            OAuthError.InvalidRequestCode,
+            "id_token_hint not valid for this client");
+    }
+
+    [Fact]
+    public async Task Id_token_hint_of_another_issuer_is_refused()
+    {
+        RegisterHint("hint", _user, issuer: "https://other.example.com");
+
+        AssertErrorRedirect(
+            await Authorize(Valid(("id_token_hint", "hint")), SignedIn()),
+            OAuthError.InvalidRequestCode,
+            "id_token_hint not valid for this client");
+    }
+
+    [Fact]
+    public async Task Id_token_hint_with_a_subject_that_is_no_user_id_is_refused()
+    {
+        _hints.Hints["hint"] = new Heimdall.Application.Logout.VerifiedIdTokenHint(Issuer, "spa", ["spa"], null);
+
+        AssertErrorRedirect(
+            await Authorize(Valid(("id_token_hint", "hint")), SignedIn()),
+            OAuthError.InvalidRequestCode,
+            "id_token_hint not valid for this client");
+    }
+
+    [Fact]
+    public async Task Oversized_id_token_hint_is_refused_before_the_signature_check()
+    {
+        AssertErrorRedirect(
+            await Authorize(Valid(("id_token_hint", new string('a', 4097))), SignedIn()),
+            OAuthError.InvalidRequestCode,
+            "id_token_hint not valid for this client");
+        Assert.Empty(_hints.Checked);
+    }
+
+    [Fact]
+    public async Task Prompt_login_with_several_sessions_shows_the_sign_in_page_not_the_picker()
+    {
+        var (cookie, _) = TwoAccounts();
+
+        Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("prompt", "login")), cookie));
+    }
+
+    [Fact]
+    public async Task Selected_session_must_still_satisfy_max_age()
+    {
+        var bob = AddBob();
+        var cookie = SignedIn(Now.AddMinutes(-20)) + "." + SignedIn(user: bob, sid: BobSid);
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(("max_age", "60")), cookie));
+        await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, "sid-for-tests-00000000", CancellationToken.None);
+
+        Assert.IsType<AuthorizeLogin>(await Resume(picker.RequestId.ToString(), cookie));
+    }
+
+    [Fact]
+    public async Task Choice_reads_the_session_list_once()
+    {
+        var (cookie, _) = TwoAccounts();
+        var queries = _sessions.Queries;
+
+        await Authorize(Valid(("login_hint", "bob@example.com")), cookie);
+
+        Assert.Equal(queries + 1, _sessions.Queries);
+    }
+
+    [Fact]
+    public async Task Sign_in_during_the_request_is_the_choice()
+    {
+        // "Use another account" on the picker: the user signs in as Bob on the page of this request.
+        var bob = AddBob();
+        var alice = SignedIn();
+        var carol = User.Create(Guid.CreateVersion7(), _tenant.Id, "carol@example.com", "hash", Now.AddDays(-1));
+        _users.Add(carol);
+        var cookie = alice + "." + SignedIn(user: carol, sid: "sid-of-carol-000000000");
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+        _time.Advance(TimeSpan.FromSeconds(30));
+        cookie += "." + SignedIn(_time.GetUtcNow(), bob, BobSid);
+
+        Assert.IsType<AuthorizeRedirect>(await Resume(picker.RequestId.ToString(), cookie));
+        Assert.Equal(bob.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Sign_in_during_the_request_wins_over_login_hint()
+    {
+        // The hint only fills the email field. The user typed another account.
+        var bob = AddBob();
+        var login = Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("login_hint", "alice@example.com"))));
+        _time.Advance(TimeSpan.FromSeconds(30));
+
+        Assert.IsType<AuthorizeRedirect>(await Resume(login.RequestId.ToString(), SignedIn(_time.GetUtcNow(), bob, BobSid)));
+        Assert.Equal(bob.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Sign_in_of_another_user_during_the_request_never_wins_over_id_token_hint()
+    {
+        var bob = AddBob();
+        RegisterHint("hint", _user);
+        var login = Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("id_token_hint", "hint"))));
+        _time.Advance(TimeSpan.FromSeconds(30));
+
+        Assert.IsType<AuthorizeLogin>(await Resume(login.RequestId.ToString(), SignedIn(_time.GetUtcNow(), bob, BobSid)));
+        Assert.Empty(_store.Codes);
+    }
+
+    [Fact]
+    public async Task Two_sign_ins_during_the_request_show_the_picker()
+    {
+        var bob = AddBob();
+        var login = Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("prompt", "login"))));
+        _time.Advance(TimeSpan.FromSeconds(30));
+        var cookie = SignedIn(_time.GetUtcNow()) + "." + SignedIn(_time.GetUtcNow(), bob, BobSid);
+
+        Assert.IsType<AuthorizeSelectAccount>(await Resume(login.RequestId.ToString(), cookie));
+    }
+
+    [Fact]
+    public async Task Sign_in_at_the_instant_of_the_request_is_not_a_choice()
+    {
+        var (cookie, _) = TwoAccounts();
+
+        // Both sessions have the time of the request. Neither is "after" it.
+        Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+    }
+
+    [Fact]
+    public async Task Explicit_selection_wins_over_a_sign_in_during_the_request()
+    {
+        var bob = AddBob();
+        var alice = SignedIn();
+        var login = Assert.IsType<AuthorizeLogin>(await Authorize(Valid(("prompt", "login")), alice));
+        _time.Advance(TimeSpan.FromSeconds(30));
+        var cookie = SignedIn(_time.GetUtcNow()) + "." + SignedIn(_time.GetUtcNow().AddSeconds(-1), bob, BobSid);
+        await _service.SelectAsync(Context, login.RequestId.ToString(), cookie, BobSid, CancellationToken.None);
+
+        Assert.IsType<AuthorizeRedirect>(await Resume(login.RequestId.ToString(), cookie));
+        Assert.Equal(bob.Id, CodeUser());
     }
 }

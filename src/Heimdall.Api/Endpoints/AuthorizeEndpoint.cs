@@ -15,6 +15,9 @@ public sealed class UiOptions
 
     public string ConsentPath { get; set; } = AccountPages.Prefix + "/consent";
 
+    /// <summary>The account picker (#41). It gets <c>request_id</c>.</summary>
+    public string SelectAccountPath { get; set; } = AccountPages.Prefix + "/select-account";
+
     /// <summary>The page for a refused request that Heimdall cannot send back to the client (U6).</summary>
     public string ErrorPath { get; set; } = AccountPages.Prefix + "/error";
 
@@ -103,6 +106,9 @@ internal static partial class AuthorizeEndpoint
 
             case AuthorizeConsent consent:
                 return Redirect(context, AppendQuery(ui.ConsentPath, [new("request_id", consent.RequestId.ToString())]));
+
+            case AuthorizeSelectAccount select:
+                return Redirect(context, AppendQuery(ui.SelectAccountPath, [new("request_id", select.RequestId.ToString())]));
 
             default:
                 throw new InvalidOperationException($"Unknown outcome {outcome.GetType().Name}.");

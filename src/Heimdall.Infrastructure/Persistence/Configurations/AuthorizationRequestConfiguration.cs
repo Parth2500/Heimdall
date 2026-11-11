@@ -17,6 +17,9 @@ internal sealed class AuthorizationRequestConfiguration : IEntityTypeConfigurati
                 "ck_authorization_requests_consent",
                 "(consent_user_id IS NULL) = (consent_approved IS NULL)");
             t.HasCheckConstraint(
+                "ck_authorization_requests_selection",
+                "(selected_sid IS NULL) = (selected_at IS NULL) AND (selected_sid IS NULL OR length(selected_sid) = 22)");
+            t.HasCheckConstraint(
                 "ck_authorization_requests_dpop_key",
                 "dpop_key_thumbprint IS NULL OR length(dpop_key_thumbprint) = 43");
         });
@@ -42,6 +45,13 @@ internal sealed class AuthorizationRequestConfiguration : IEntityTypeConfigurati
         builder.Property(r => r.DpopKeyThumbprint).HasMaxLength(43);
         builder.Property(r => r.PromptNone);
         builder.Property(r => r.ForceConsent);
+
+        // The account choice (#41, D51 to D53).
+        builder.Property(r => r.SelectAccount);
+        builder.Property(r => r.LoginHint).HasMaxLength(AuthorizationRequest.MaxLoginHintLength);
+        builder.Property(r => r.HintUserId);
+        builder.Property(r => r.SelectedSid).HasMaxLength(22);
+        builder.Property(r => r.SelectedAt);
 
         // D41, D42: /authorize finds a pushed request by the hash of its request_uri. Unique, so one value can never
         // match two rows. The plain request_uri is never stored (D3).

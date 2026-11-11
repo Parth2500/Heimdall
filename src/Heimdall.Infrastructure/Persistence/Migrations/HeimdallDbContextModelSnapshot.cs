@@ -606,6 +606,15 @@ namespace Heimdall.Infrastructure.Persistence.Migrations
                         .HasColumnType("boolean")
                         .HasColumnName("force_login");
 
+                    b.Property<Guid?>("HintUserId")
+                        .HasColumnType("uuid")
+                        .HasColumnName("hint_user_id");
+
+                    b.Property<string>("LoginHint")
+                        .HasMaxLength(254)
+                        .HasColumnType("character varying(254)")
+                        .HasColumnName("login_hint");
+
                     b.Property<int?>("MaxAge")
                         .HasColumnType("integer")
                         .HasColumnName("max_age_seconds");
@@ -635,6 +644,19 @@ namespace Heimdall.Infrastructure.Persistence.Migrations
                         .HasMaxLength(1024)
                         .HasColumnType("character varying(1024)")
                         .HasColumnName("scope");
+
+                    b.Property<bool>("SelectAccount")
+                        .HasColumnType("boolean")
+                        .HasColumnName("select_account");
+
+                    b.Property<DateTimeOffset?>("SelectedAt")
+                        .HasColumnType("timestamp with time zone")
+                        .HasColumnName("selected_at");
+
+                    b.Property<string>("SelectedSid")
+                        .HasMaxLength(22)
+                        .HasColumnType("character varying(22)")
+                        .HasColumnName("selected_sid");
 
                     b.Property<string>("State")
                         .HasMaxLength(512)
@@ -666,6 +688,8 @@ namespace Heimdall.Infrastructure.Persistence.Migrations
                             t.HasCheckConstraint("ck_authorization_requests_dpop_key", "dpop_key_thumbprint IS NULL OR length(dpop_key_thumbprint) = 43");
 
                             t.HasCheckConstraint("ck_authorization_requests_max_age", "max_age_seconds IS NULL OR max_age_seconds >= 0");
+
+                            t.HasCheckConstraint("ck_authorization_requests_selection", "(selected_sid IS NULL) = (selected_at IS NULL) AND (selected_sid IS NULL OR length(selected_sid) = 22)");
                         });
                 });
 

@@ -26,3 +26,6 @@ public sealed record AuthorizeLogin(Guid RequestId) : AuthorizeOutcome;
 
 /// <summary>The user must approve the client. The consent page gets the stored request ID only.</summary>
 public sealed record AuthorizeConsent(Guid RequestId) : AuthorizeOutcome;
+
+/// <summary>Show the account picker. The request is stored, and the page continues it by ID.</summary>
+public sealed record AuthorizeSelectAccount(Guid RequestId) : AuthorizeOutcome;

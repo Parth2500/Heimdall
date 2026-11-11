@@ -1,6 +1,6 @@
 # Decision records
 
-The current decisions are in the decision tables: D1 to D50 in the [threat model](../threat-model.md), and U1 to U17 in the [front-end design](../frontend-design.md). A table shows only what is true now.
+The current decisions are in the decision tables: D1 to D54 in the [threat model](../threat-model.md), and U1 to U17 in the [front-end design](../frontend-design.md). A table shows only what is true now.
 
 A decision record keeps the history. Each record is one change to a decision: what was true before, what is true after, and the reason. A correction to the first draft also gets a record. A new decision gets a row in its table and no record.
 

@@ -144,6 +144,15 @@ The rules are D24 to D28. The table covers the proof itself. The sections for `/
 | Denial of service | Large or slow proofs cost CPU. | The proof has a size limit. Heimdall checks the format, the header, and the claims before the signature, and the signature before the database. |
 
 ## `GET /oauth/v1/authorize` (worked example)
+
+Additional decisions for the account choice (#41). The design note is `docs/account-picker-design.md`.
+
+| ID | Decision | Reason |
+|---|---|---|
+| D51 | `/authorize` chooses the session of the browser's session list in this order. (1) The user's choice for this request: a selection on the account picker (D52), or the one sign-in after the request was created. (2) `id_token_hint`: the live session of that user (D54). (3) `login_hint`: the live session of the user with that email (D53). (4) No hint: with exactly one session in the list, and that session live, Heimdall uses it. In every other case with a session in the list, Heimdall shows the account picker. With `prompt=none`, Heimdall shows no page: the account picker becomes the error `account_selection_required`, and a missing session becomes `login_required`. `prompt=select_account` always asks for the user's choice. `prompt=login` with no choice and no hint goes to the sign-in page, not to the picker. The chosen session must also satisfy `prompt=login` and `max_age`. The consent API makes the same choice. | A user's choice wins over a client's hint. One session keeps single sign-on. With several accounts, Heimdall must not guess: a wrong guess signs the user in to a client as the wrong account. OpenID Connect Core, sections 3.1.2.1 and 3.1.2.6, defines the `prompt` values and both error codes. |
+| D52 | A selection is one stored value on the authorization request: the `sid` of the chosen session, and the time. Heimdall records it only for a live session of the browser's session list. The resume step checks again that the session is live and in the list. | The choice binds to one request, like a consent decision. The `sid` cannot authenticate anything (D29). Here it only selects inside the list that the cookie authenticated. |
+| D53 | `login_hint` is an email address of at most 254 characters. Heimdall ignores any other value. The sign-in page fills the email field with it. With `prompt=none`, a hint for an account that is not signed in and a hint for an account that does not exist give the same `login_required`. | The hint saves typing. An answer about the account would be an enumeration oracle (D5). |
+| D54 | An `id_token_hint` at `/authorize` is valid when Heimdall signed it with a key of the tenant, `iss` is the tenant, `aud` is this one client, and `sub` is a user ID. Heimdall ignores `exp`, as in D30. An invalid hint is `invalid_request`. With a valid hint, only a live session of that user gets the code, also after a sign-in as another user. | OpenID Connect Core, section 3.1.2.1: the client names the user that it expects. A client that renews without a page sends this hint, so that it never gets another account. Heimdall does not continue without a hint that it cannot verify, because the client would then get an account that it did not ask for. |
 | STRIDE | Threat | Mitigation |
 |---|---|---|
 | Spoofing | A rogue client registers a redirect URI that looks like a real one. | Heimdall compares redirect URIs by exact match. It allows no wildcards. An admin must approve each client registration. |
@@ -155,6 +164,12 @@ The rules are D24 to D28. The table covers the proof itself. The sections for `/
 | Tampering | Open redirect: an attacker puts an unregistered `redirect_uri` in the link, so an error carries the user to the attacker's site. | Until `client_id` and `redirect_uri` pass the exact-match check, Heimdall shows its own error and never redirects (RFC 6749, section 4.1.2.1). A repeated parameter also gets this error. |
 | Spoofing | Mix-up: a client that uses several servers sends a code to the wrong one. | Every redirect from `/authorize` carries `iss`, on success and on error (RFC 9207, D9). |
 | Tampering | The browser changes the request between login and the code. | Heimdall stores the checked request. The login page and the resume step get only the request ID. One request gives one code, enforced by the `DELETE` in the code transaction. |
+| Spoofing | With several accounts in the browser, a client gets the code of an account that the user did not intend. | Heimdall never guesses between accounts. It uses the user's choice, a valid hint, or the single session (D51). |
+| Tampering | An attacker's request names the `sid` of a victim's session as the selection. | A selection counts only for a live session in the session list of the same cookie, checked at the selection and again at the resume step (D52). |
+| Repudiation | A user says they did not choose that account. | Heimdall writes `account.selected` with the `sid`, the request, and the correlation ID. |
+| Information disclosure | A client learns that the browser holds several accounts, from `account_selection_required`. | Accepted. The answer is one bit, and it goes only to a registered redirect URI of the client. OpenID Connect defines the error for this case. |
+| Information disclosure | A client uses `login_hint` to test whether an account exists. | The sign-in page looks the same for every hint, and `prompt=none` gives one error for every hint without a live session (D53). |
+| Elevation of privilege | A client sends the `id_token_hint` of another client, or a forged one, to get a user's account. | Heimdall checks the signature, `iss`, and `aud` against this client (D54). The hint only narrows the choice to sessions that this browser already holds. |
 
 ## `POST /oauth/v1/token`
 

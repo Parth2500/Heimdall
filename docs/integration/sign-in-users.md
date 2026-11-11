@@ -58,8 +58,12 @@ Redirect the browser to the `authorization_endpoint` with these query parameters
 | `code_challenge_method` | Yes | `S256`. Heimdall refuses `plain` and a missing value. |
 | `state` | Recommended | From step 2. At most 512 characters. |
 | `nonce` | Recommended with `openid` | From step 2. At most 512 characters. |
-| `prompt` | No | Space-separated. `login` makes the user sign in again. `consent` shows the consent page, also when your client does not require consent. `none` never shows a page and cannot be combined with another value. `select_account` is not supported yet (#41). |
+| `prompt` | No | Space-separated. `login` makes the user sign in again. `consent` shows the consent page, also when your client does not require consent. `none` never shows a page and cannot be combined with another value. `select_account` shows the account picker, also when one account is signed in. |
+| `login_hint` | No | The email address of the user that you expect. Heimdall uses that account when it is signed in. If not, the sign-in page shows the address. Heimdall never tells you whether the account exists. |
+| `id_token_hint` | No | The last ID token that you got for the user. Send it with `prompt=none` to renew a sign-in. You then get that user or an error, never another account. |
 | `max_age` | No | Seconds. If the user signed in longer ago, Heimdall asks again. |
+
+One browser can hold several accounts of a tenant. With several accounts and no hint from you, Heimdall shows the account picker. With `prompt=none`, you get `account_selection_required` instead.
 
 Heimdall refuses a request that repeats a parameter. Heimdall ignores parameters that it does not know.
 

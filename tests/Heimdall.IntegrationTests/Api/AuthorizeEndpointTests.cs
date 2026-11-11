@@ -347,4 +347,110 @@ public sealed class AuthorizeEndpointTests
         await Task.CompletedTask;
         Assert.Equal(Challenge, Base64Url.EncodeToString(SHA256.HashData(Encoding.ASCII.GetBytes(Verifier))));
     }
+
+    // ---- Several accounts in one browser (#41, D51 to D53)
+
+    private static async Task<string> CodeEmailAsync(Setup setup, string code)
+    {
+        await using var scope = setup.Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<TenantScope>().Set(setup.Tenant.Tenant.Id);
+        var db = scope.ServiceProvider.GetRequiredService<HeimdallDbContext>();
+        var hash = Heimdall.Domain.Common.TokenHash.Compute(code);
+        var userId = (await db.AuthorizationCodes.AsNoTracking().SingleAsync(c => c.CodeHash == hash)).UserId;
+        return (await db.Users.AsNoTracking().SingleAsync(u => u.Id == userId)).Email;
+    }
+
+    private static async Task AddBobAsync(Setup setup)
+    {
+        await setup.Api.AddUserAsync(setup.Tenant, "bob@example.com", Password);
+        using var login = await setup.Browser.LoginAsync("bob@example.com", Password);
+        Assert.Equal(HttpStatusCode.NoContent, login.StatusCode);
+    }
+
+    [DockerFact]
+    public async Task Two_accounts_and_no_hint_send_the_browser_to_the_account_picker()
+    {
+        await using var setup = await SetUpAsync();
+        await AddBobAsync(setup);
+
+        using var response = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl());
+
+        var query = QueryOf(response, out var path);
+        Assert.Equal("/account/select-account", path);
+        Assert.Equal(["request_id"], query.Keys);
+    }
+
+    [DockerFact]
+    public async Task Two_accounts_and_prompt_none_give_account_selection_required()
+    {
+        await using var setup = await SetUpAsync();
+        await AddBobAsync(setup);
+
+        using var response = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("prompt", "none")));
+
+        var query = QueryOf(response, out var target);
+        Assert.Equal(Callback, target);
+        Assert.Equal("account_selection_required", query["error"]);
+        Assert.Equal(setup.Tenant.Issuer, query["iss"]);
+    }
+
+    [DockerFact]
+    public async Task Login_hint_chooses_between_two_accounts_and_is_stored_for_the_sign_in_page()
+    {
+        await using var setup = await SetUpAsync();
+        await AddBobAsync(setup);
+
+        using var alice = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("login_hint", Email), ("prompt", "none")));
+        Assert.Equal(Email, await CodeEmailAsync(setup, QueryOf(alice, out _)["code"]));
+
+        using var bob = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("login_hint", "BOB@example.com")));
+        Assert.Equal("bob@example.com", await CodeEmailAsync(setup, QueryOf(bob, out _)["code"]));
+
+        // An account that is not signed in, or does not exist: the sign-in page, with the hint in the stored request.
+        using var carol = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("login_hint", "carol@example.com")));
+        var requestId = QueryOf(carol, out var path)["request_id"];
+        Assert.Equal("/account/login", path);
+        await using var scope = setup.Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<TenantScope>().Set(setup.Tenant.Tenant.Id);
+        var stored = await scope.ServiceProvider.GetRequiredService<HeimdallDbContext>().AuthorizationRequests.AsNoTracking()
+            .SingleAsync(r => r.Id == Guid.Parse(requestId));
+        Assert.Equal("carol@example.com", stored.LoginHint);
+    }
+
+    [DockerFact]
+    public async Task Sign_in_as_another_account_during_the_request_gets_the_code_for_that_account()
+    {
+        await using var setup = await SetUpAsync();
+        using var first = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("prompt", "select_account")));
+        var requestId = QueryOf(first, out var path)["request_id"];
+        Assert.Equal("/account/select-account", path);
+
+        setup.Api.Time.Advance(TimeSpan.FromSeconds(1));
+        await AddBobAsync(setup);
+        using var resumed = await setup.Browser.SendAsync(HttpMethod.Get, $"oauth/v1/authorize/resume?request_id={requestId}");
+
+        Assert.Equal("bob@example.com", await CodeEmailAsync(setup, QueryOf(resumed, out _)["code"]));
+    }
+
+    [DockerFact]
+    public async Task Forged_id_token_hint_is_refused()
+    {
+        await using var setup = await SetUpAsync();
+
+        using var response = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("id_token_hint", "eyJhbGciOiJSUzI1NiJ9.e30.AAAA")));
+
+        Assert.Equal("invalid_request", QueryOf(response, out _)["error"]);
+    }
+
+    [DockerFact]
+    public async Task Prompt_select_account_is_accepted()
+    {
+        await using var setup = await SetUpAsync(signIn: false);
+
+        using var response = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("prompt", "select_account")));
+
+        // No session in the list: nothing to pick from, so the sign-in page.
+        QueryOf(response, out var path);
+        Assert.Equal("/account/login", path);
+    }
 }

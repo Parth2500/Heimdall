@@ -1,6 +1,6 @@
 # Heimdall Schema Design (Phase 0)
 
-This document defines the PostgreSQL schema. It uses the terms in the glossary of `docs/threat-model.md`. Decision IDs (D1 to D50) refer to that document.
+This document defines the PostgreSQL schema. It uses the terms in the glossary of `docs/threat-model.md`. Decision IDs (D1 to D54) refer to that document.
 
 The document has no C# code. The entities and the migrations are written by hand, from this design.
 
@@ -129,6 +129,11 @@ Heimdall stores the pending `/authorize` request here while the user signs in an
 | `consent_user_id`, `consent_approved` | uuid null, boolean null | The consent decision for this request and the user who made it. Check: both null or both set. |
 | `dpop_key_thumbprint` | text, null | The request's `dpop_jkt` (D27), or the key of the DPoP proof at `/par` (D40). Check: null or 43 characters. Heimdall copies it to the code. |
 | `prompt_none` | boolean | `prompt=none`. A pushed request needs it, because `/authorize` does not see the parameters again. |
+| `select_account` | boolean | `prompt=select_account` (D51). |
+| `login_hint` | varchar(254), null | The request's `login_hint`, when it is an email address (D53). |
+| `hint_user_id` | uuid, null | The `sub` of a valid `id_token_hint` (D54). |
+| `selected_sid` | varchar(22), null | The `sid` of the session that the user chose (D52). A check constraint holds the length, and sets it together with `selected_at`. |
+| `selected_at` | timestamptz, null | When the user chose. |
 | `force_consent` | boolean | `prompt=consent`: the user decides on the consent page, also for a client that does not require consent. |
 | `request_uri_hash` | bytea, null | The SHA-256 of the `request_uri` of a pushed request (D41). **Unique with `tenant_id`** where not null. `/authorize` clears it when it takes the request (D42). |
 

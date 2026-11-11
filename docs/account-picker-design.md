@@ -130,6 +130,8 @@ The idle timeout moves only for the session that `/authorize` uses. A view of th
 
 Each step has its tests and one commit.
 
+Step 2 is done (2026-11-12): D51 to D54 in the threat model. One rule is new against P5: a sign-in after the request was created counts as the user's choice, when it is the only one. Without it, `prompt=login` and "Use another account" would need the login API to record a selection. P9 no longer needs that, so the login API does not change.
+
 Step 1 is done (2026-11-12): D12, D13, and D50 in the threat model, and DR-013. Until step 2, `/authorize`, the consent API, and sign-out use the live session of the latest sign-in. Until step 3, a sign-out ends every live session of the list and deletes the cookie, so no session stays live behind a deleted cookie.
 
 1. **Session list.** Cookie parser, validation of the list in one query, the limit, and re-authentication in place (P1 to P4). `Session` gets the re-authentication rule.

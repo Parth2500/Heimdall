@@ -28,6 +28,7 @@ public class PushedAuthorizationTests
     private readonly FakeDpopProofValidator _proofs = new();
     private readonly InMemoryDpopReplayStore _replay = new();
     private readonly RecordingAuditLog _audit = new();
+    private readonly FakeIdTokenHintValidator _hints = new();
     private readonly PushedAuthorization _service;
 
     public PushedAuthorizationTests()
@@ -41,7 +42,7 @@ public class PushedAuthorizationTests
         _service = new PushedAuthorization(
             new ClientAuthenticator(_clients, new FakeClientAssertionValidator(), new InMemoryClientAssertionReplayStore(), _time),
             new DpopTokenCheck(_proofs, _replay),
-            new AuthorizationService(_clients, _store, sessions, _audit, _time),
+            new AuthorizationService(_clients, _store, sessions, _hints, _audit, _time),
             _audit,
             _time);
 

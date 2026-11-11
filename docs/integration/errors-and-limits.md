@@ -27,7 +27,8 @@ These errors come back to your `redirect_uri` as query parameters, with `state` 
 | `request_not_supported` | You sent `request`. | Remove it. |
 | `invalid_request` (error page) | The `request_uri` is unknown, used, expired, or was pushed by another client. | Push the request again, then use the new `request_uri` within 60 seconds, once. See [Pushed authorization requests](par.md). |
 | `access_denied` | The user refused consent. | Show a message. Do not retry at once. |
-| `login_required` | `prompt=none` and the user has no valid Heimdall session. | Send the user to `/authorize` without `prompt=none`. |
+| `login_required` | `prompt=none` and the user has no valid Heimdall session. With `login_hint` or `id_token_hint`: that user has no valid session in this browser. | Send the user to `/authorize` without `prompt=none`. |
+| `account_selection_required` | `prompt=none`, the browser holds several accounts, and your request has no hint. | Send `id_token_hint` or `login_hint` with `prompt=none`. Or send the user to `/authorize` without `prompt=none`. |
 | `consent_required` | `prompt=none` and your client needs consent. | Send the user to `/authorize` without `prompt=none`. |
 
 ### Errors on a Heimdall page

@@ -190,8 +190,10 @@ public sealed class ConsentTests
 
         using var resume = await ResumeAsync(setup);
 
+        // Two live sessions and no choice for this request: the user picks the account first (D51). The approval of the
+        // first user gives no code.
         QueryOf(resume, out var path);
-        Assert.Equal("/account/consent", path);
+        Assert.Equal("/account/select-account", path);
     }
 
     [DockerFact]

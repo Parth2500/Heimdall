@@ -110,12 +110,6 @@ public sealed class ConsentService
     {
         ArgumentNullException.ThrowIfNull(context);
 
-        var session = await _sessions.ValidateAsync(context, sessionId, cancellationToken).ConfigureAwait(false);
-        if (session is null)
-        {
-            return Fail(new OAuthError(LoginRequiredCode, "no session"));
-        }
-
         if (!Guid.TryParse(requestId, out var id))
         {
             return Fail(OAuthError.InvalidRequest("request_id malformed"));
@@ -129,10 +123,12 @@ public sealed class ConsentService
             return Fail(OAuthError.InvalidRequest(request is { RequestUriHash: null } ? "request expired" : "request unknown or used"));
         }
 
-        // The same session rules as the resume step: prompt=login and max_age apply to the consent page too.
-        if (!request.AcceptsSession(session.Session, now))
+        // The same choice as the resume step (D51): the account of the request decides, and prompt=login and max_age
+        // apply to the consent page too. So the consent is always the consent of the account that gets the code.
+        var choice = await _sessions.ChooseAsync(context, request, sessionId, cancellationToken).ConfigureAwait(false);
+        if (choice.Session is not { } session)
         {
-            return Fail(new OAuthError(LoginRequiredCode, "session does not satisfy the request"));
+            return Fail(new OAuthError(LoginRequiredCode, "no session that satisfies the request"));
         }
 
         var client = await _clients.FindByPkAsync(context.Tenant.Id, request.ClientPk, cancellationToken).ConfigureAwait(false);

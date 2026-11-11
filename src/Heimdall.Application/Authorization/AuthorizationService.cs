@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using Heimdall.Application.Audit;
 using Heimdall.Application.Clients;
 using Heimdall.Application.Common;
+using Heimdall.Application.Logout;
 using Heimdall.Application.Sessions;
 using Heimdall.Domain.Audit;
 using Heimdall.Domain.Clients;
@@ -32,11 +33,20 @@ public sealed class AuthorizationService
     /// <summary>RFC 9126, section 2.2: the URN form of a <c>request_uri</c>. 256 random bits follow it.</summary>
     public const string RequestUriPrefix = "urn:ietf:params:oauth:request_uri:";
 
-    private static readonly string[] SupportedPrompts = ["none", "login", "consent"];
+    /// <summary>
+    /// OpenID Connect Core, section 3.1.2.6: several sessions are live, and <c>prompt=none</c> forbids the account picker.
+    /// </summary>
+    public const string AccountSelectionRequiredCode = "account_selection_required";
+
+    // A longer value cannot be an ID token of Heimdall. It is refused before the signature check.
+    private const int MaxIdTokenHintLength = 4096;
+
+    private static readonly string[] SupportedPrompts = ["none", "login", "consent", "select_account"];
 
     private readonly IClientStore _clients;
     private readonly IAuthorizationStore _store;
     private readonly SessionService _sessions;
+    private readonly IIdTokenHintValidator _hints;
     private readonly IAuditLog _audit;
     private readonly TimeProvider _time;
 
@@ -44,12 +54,14 @@ public sealed class AuthorizationService
         IClientStore clients,
         IAuthorizationStore store,
         SessionService sessions,
+        IIdTokenHintValidator hints,
         IAuditLog audit,
         TimeProvider time)
     {
         _clients = clients;
         _store = store;
         _sessions = sessions;
+        _hints = hints;
         _audit = audit;
         _time = time;
     }
@@ -91,7 +103,8 @@ public sealed class AuthorizationService
             return await ContinuePushedAsync(context, client, requestUri, sessionId, cancellationToken).ConfigureAwait(false);
         }
 
-        var checkedRequest = Check(context, client, Get, null);
+        var hint = await ReadHintAsync(context, client, Get("id_token_hint"), cancellationToken).ConfigureAwait(false);
+        var checkedRequest = Check(context, client, Get, null, hint);
         if (checkedRequest.Outcome is { } refused)
         {
             return refused;
@@ -156,7 +169,8 @@ public sealed class AuthorizationService
         }
 
         var requestUri = RequestUriPrefix + Base64Url.EncodeToString(RandomNumberGenerator.GetBytes(32));
-        var checkedRequest = Check(context, client, Get, TokenHash.Compute(requestUri), proofKeyThumbprint);
+        var hint = await ReadHintAsync(context, client, Get("id_token_hint"), cancellationToken).ConfigureAwait(false);
+        var checkedRequest = Check(context, client, Get, TokenHash.Compute(requestUri), hint, proofKeyThumbprint);
         if (checkedRequest.Outcome is { } refused)
         {
             // The client called Heimdall directly, so the error goes back in the response, never to a redirect.
@@ -238,6 +252,96 @@ public sealed class AuthorizationService
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Records the account that the user chose on the account picker for a stored request (D52). The session must be a
+    /// live session of this browser's list. The resume step checks that again.
+    /// </summary>
+    /// <param name="sid">The public <c>sid</c> of the chosen session. Here it only selects inside the list that the cookie authenticated.</param>
+    public async Task<Result<bool>> SelectAsync(
+        RequestContext context,
+        string? requestId,
+        string? sessionCookie,
+        string? sid,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        if (!Guid.TryParse(requestId, out var id))
+        {
+            return Result.Failure<bool>(OAuthError.InvalidRequest("request_id malformed"));
+        }
+
+        var now = _time.GetUtcNow();
+        var request = await _store.FindRequestAsync(context.Tenant.Id, id, cancellationToken).ConfigureAwait(false);
+        if (request is null || request.RequestUriHash is not null || request.IsExpired(now))
+        {
+            return Result.Failure<bool>(OAuthError.InvalidRequest(request is { RequestUriHash: null } ? "request expired" : "request unknown or used"));
+        }
+
+        var listed = await _sessions.ListAsync(context, sessionCookie, cancellationToken).ConfigureAwait(false);
+        if (listed.FirstOrDefault(l => l.Live && string.Equals(l.Session.Sid, sid, StringComparison.Ordinal)) is not { } chosen)
+        {
+            return Result.Failure<bool>(OAuthError.InvalidRequest("no live session with this sid in the session list"));
+        }
+
+        request.Select(chosen.Session.Sid, now);
+        try
+        {
+            await _store.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (ConcurrentUpdateException)
+        {
+            return Result.Failure<bool>(OAuthError.InvalidRequest("request already used"));
+        }
+
+        await _audit.WriteAsync(
+            AuditEvent.Record(
+                Guid.CreateVersion7(),
+                context.Tenant.Id,
+                AuditEventTypes.AccountSelected,
+                context.CorrelationId,
+                now,
+                context.SourceIp,
+                subjectUserId: chosen.User.Id,
+                clientPk: request.ClientPk,
+                data: new Dictionary<string, string> { ["sid"] = chosen.Session.Sid, ["request_id"] = request.Id.ToString() }),
+            cancellationToken).ConfigureAwait(false);
+        return Result.Success(true);
+    }
+
+    /// <summary>An <c>id_token_hint</c> of the request: absent, valid for a user, or not valid.</summary>
+    private readonly record struct IdTokenHint(bool Present, Guid? UserId)
+    {
+        public bool Invalid => Present && UserId is null;
+    }
+
+    /// <summary>
+    /// OpenID Connect Core, section 3.1.2.1: an ID token that Heimdall issued to this client names the expected user.
+    /// It is valid when Heimdall signed it with a key of the tenant, <c>iss</c> is the tenant, and <c>aud</c> is this
+    /// client. <c>exp</c> does not count (as in D30): the hint proves nothing, it only names a user.
+    /// </summary>
+    private async Task<IdTokenHint> ReadHintAsync(RequestContext context, Client client, string? hintText, CancellationToken cancellationToken)
+    {
+        if (hintText is null)
+        {
+            return default;
+        }
+
+        if (hintText.Length > MaxIdTokenHintLength)
+        {
+            return new IdTokenHint(true, null);
+        }
+
+        var hint = await _hints.ValidateAsync(context.Tenant.Id, hintText, cancellationToken).ConfigureAwait(false);
+        var valid = hint is not null
+            && hint.Issuer == context.Issuer
+            && hint.Audiences is [var audience]
+            && string.Equals(audience, client.ClientId, StringComparison.Ordinal)
+            && Guid.TryParse(hint.Subject, out var userId)
+            && userId != Guid.Empty;
+        return new IdTokenHint(true, valid ? Guid.Parse(hint!.Subject) : null);
+    }
+
     /// <summary>The result of the checks: a refusal, or the checked request (not stored yet).</summary>
     private readonly record struct CheckedRequest(AuthorizeOutcome? Outcome, AuthorizationRequest? Request);
 
@@ -253,6 +357,7 @@ public sealed class AuthorizationService
         Client client,
         Func<string, string?> get,
         TokenHash? requestUriHash,
+        IdTokenHint hint,
         string? proofKeyThumbprint = null)
     {
         string redirectUri;
@@ -335,7 +440,6 @@ public sealed class AuthorizationService
         }
 
         // OpenID Connect Core, section 3.1.2.1: a space-separated list. "none" with any other value is an error.
-        // "select_account" needs the account picker (#41), so it is not supported yet.
         var prompts = (get("prompt") ?? string.Empty).Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (prompts.Any(p => !SupportedPrompts.Contains(p, StringComparer.Ordinal)) || prompts.Distinct(StringComparer.Ordinal).Count() != prompts.Length)
         {
@@ -345,6 +449,20 @@ public sealed class AuthorizationService
         if (prompts.Contains("none") && prompts.Length > 1)
         {
             return Fail(OAuthError.InvalidRequestCode, "prompt=none with another value");
+        }
+
+        // A hint that Heimdall did not issue to this client is a client error. Heimdall does not continue without it,
+        // because the client asked for one user and could get another.
+        if (hint.Invalid)
+        {
+            return Fail(OAuthError.InvalidRequestCode, "id_token_hint not valid for this client");
+        }
+
+        // D53: a login_hint is an email address. Any other value is ignored, as the specification allows.
+        var loginHint = get("login_hint")?.Trim();
+        if (!AuthorizationRequest.IsLoginHint(loginHint))
+        {
+            loginHint = null;
         }
 
         TimeSpan? maxAge = null;
@@ -388,7 +506,10 @@ public sealed class AuthorizationService
             dpopKeyThumbprint,
             promptNone: prompts.Contains("none"),
             requestUriHash,
-            forceConsent: prompts.Contains("consent")));
+            forceConsent: prompts.Contains("consent"),
+            selectAccount: prompts.Contains("select_account"),
+            loginHint,
+            hint.UserId));
     }
 
     /// <summary>
@@ -413,8 +534,16 @@ public sealed class AuthorizationService
         CancellationToken cancellationToken)
     {
         var now = _time.GetUtcNow();
-        var session = await _sessions.ValidateAsync(context, sessionId, cancellationToken).ConfigureAwait(false);
-        if (session is null || !request.AcceptsSession(session.Session, now))
+        var choice = await _sessions.ChooseAsync(context, request, sessionId, cancellationToken).ConfigureAwait(false);
+        if (choice.Kind == SessionChoiceKind.Picker)
+        {
+            // D51: Heimdall never guesses between accounts, and prompt=none forbids the page.
+            return promptNone
+                ? ErrorRedirect(context, request.RedirectUri, request.State, AccountSelectionRequiredCode, "prompt=none with several accounts and no hint")
+                : await ShowPageAsync(request, stored, new AuthorizeSelectAccount(request.Id), cancellationToken).ConfigureAwait(false);
+        }
+
+        if (choice.Session is not { } session)
         {
             return promptNone
                 ? ErrorRedirect(context, request.RedirectUri, request.State, "login_required", "prompt=none without a usable session")

@@ -81,7 +81,9 @@ Starts the authorization code flow. The browser calls it, not your server.
 | `state` | No (recommended) | At most 512 characters. |
 | `nonce` | No (recommended) | At most 512 characters. Copied into the ID token. |
 | `dpop_jkt` | No | The RFC 7638 thumbprint of your DPoP key. The code then needs a DPoP proof from that key at `/token`. See [DPoP](dpop.md). |
-| `prompt` | No | `none`, `login`, `consent`, or `login consent`. `none` cannot be combined with another value. Each value at most once. |
+| `prompt` | No | A space-separated list of `none`, `login`, `consent`, and `select_account`. `none` cannot be combined with another value. Each value at most once. |
+| `login_hint` | No | An email address, at most 254 characters. Heimdall ignores any other value. |
+| `id_token_hint` | No | An ID token that Heimdall issued to your client. An expired one is valid. Only that user gets the code. |
 | `max_age` | No | Seconds, as a non-negative integer. |
 | `response_mode` | No | `query` only. |
 | `request`, `request_uri` | Not supported | Heimdall refuses them. |

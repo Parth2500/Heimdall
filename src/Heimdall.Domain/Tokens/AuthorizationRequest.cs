@@ -22,6 +22,9 @@ public sealed class AuthorizationRequest
     /// <summary>The longest <c>state</c> or <c>nonce</c> value. Both are client values that Heimdall stores and echoes.</summary>
     public const int MaxClientValueLength = 512;
 
+    /// <summary>The longest <c>login_hint</c>: the longest email address (RFC 5321).</summary>
+    public const int MaxLoginHintLength = 254;
+
 #pragma warning disable CS8618 // EF Core sets the properties after it calls this constructor.
     private AuthorizationRequest()
     {
@@ -43,9 +46,15 @@ public sealed class AuthorizationRequest
         string? dpopKeyThumbprint,
         bool promptNone,
         TokenHash? requestUriHash,
-        bool forceConsent)
+        bool forceConsent,
+        bool selectAccount,
+        string? loginHint,
+        Guid? hintUserId)
     {
         Id = id;
+        SelectAccount = selectAccount;
+        LoginHint = loginHint;
+        HintUserId = hintUserId;
         ForceConsent = forceConsent;
         PromptNone = promptNone;
         RequestUriHash = requestUriHash;
@@ -117,6 +126,26 @@ public sealed class AuthorizationRequest
     public string? DpopKeyThumbprint { get; }
 
     /// <summary>The user who decided on the consent page, or null. A decision counts only for this user.</summary>
+    /// <summary>
+    /// <c>prompt=select_account</c> (OpenID Connect Core, section 3.1.2.1): the user chooses the account on the account
+    /// picker for this request, also when the browser has one live session.
+    /// </summary>
+    public bool SelectAccount { get; }
+
+    /// <summary>
+    /// The <c>login_hint</c>: an email address that the client expects. It chooses a live session of that user, or
+    /// fills the email field of the sign-in page. Heimdall never answers whether the account exists (D5).
+    /// </summary>
+    public string? LoginHint { get; }
+
+    /// <summary>The user that a valid <c>id_token_hint</c> names. Only a live session of this user serves the request.</summary>
+    public Guid? HintUserId { get; }
+
+    /// <summary>The <c>sid</c> of the session that the user chose for this request, on the account picker or by a sign-in.</summary>
+    public string? SelectedSid { get; private set; }
+
+    public DateTimeOffset? SelectedAt { get; private set; }
+
     public Guid? ConsentUserId { get; private set; }
 
     /// <summary>The decision of <see cref="ConsentUserId"/>: true to approve, false to deny, null when none.</summary>
@@ -137,13 +166,16 @@ public sealed class AuthorizationRequest
         string? dpopKeyThumbprint = null,
         bool promptNone = false,
         TokenHash? requestUriHash = null,
-        bool forceConsent = false)
+        bool forceConsent = false,
+        bool selectAccount = false,
+        string? loginHint = null,
+        Guid? hintUserId = null)
     {
         Guard.NotEmpty(id, nameof(id));
         Guard.NotEmpty(tenantId, nameof(tenantId));
         Guard.NotEmpty(clientPk, nameof(clientPk));
 
-        if (promptNone && (forceLogin || forceConsent))
+        if (promptNone && (forceLogin || forceConsent || selectAccount))
         {
             // OpenID Connect Core, section 3.1.2.1: none with any other value is an error.
             throw new DomainException("prompt=none cannot be combined with another prompt value.");
@@ -164,6 +196,16 @@ public sealed class AuthorizationRequest
             throw new DomainException("The max_age must not be negative.");
         }
 
+        if (loginHint is not null && !IsLoginHint(loginHint))
+        {
+            throw new DomainException($"The login_hint must be an email address of at most {MaxLoginHintLength} characters.");
+        }
+
+        if (hintUserId == Guid.Empty)
+        {
+            throw new DomainException("The hint must name a user.");
+        }
+
         return new AuthorizationRequest(
             id,
             tenantId,
@@ -179,7 +221,38 @@ public sealed class AuthorizationRequest
             dpopKeyThumbprint is null ? null : KeyThumbprint.Require(dpopKeyThumbprint, nameof(dpopKeyThumbprint)),
             promptNone,
             requestUriHash,
-            forceConsent);
+            forceConsent,
+            selectAccount,
+            loginHint,
+            hintUserId);
+    }
+
+    /// <summary>
+    /// True for a value that can be a <c>login_hint</c>: one <c>@</c> with text on both sides, no space or control
+    /// character, and at most <see cref="MaxLoginHintLength"/> characters. Heimdall ignores any other value.
+    /// </summary>
+    public static bool IsLoginHint(string? value)
+    {
+        if (value is null || value.Length > MaxLoginHintLength)
+        {
+            return false;
+        }
+
+        var at = value.IndexOf('@', StringComparison.Ordinal);
+        return at > 0
+            && at < value.Length - 1
+            && value.IndexOf('@', at + 1) < 0
+            && !value.Any(c => char.IsWhiteSpace(c) || char.IsControl(c));
+    }
+
+    /// <summary>
+    /// Records the session that the user chose for this request. A later choice replaces it. The caller proves that
+    /// the session is a live session of the browser's session list.
+    /// </summary>
+    public void Select(string sid, DateTimeOffset now)
+    {
+        SelectedSid = SessionSid.Require(sid, nameof(sid));
+        SelectedAt = now;
     }
 
     public bool IsExpired(DateTimeOffset now) => now >= ExpiresAt;

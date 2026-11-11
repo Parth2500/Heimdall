@@ -6,6 +6,7 @@ using Heimdall.Application.Users;
 using Heimdall.Domain.Audit;
 using Heimdall.Domain.Common;
 using Heimdall.Domain.Sessions;
+using Heimdall.Domain.Tokens;
 using Heimdall.Domain.Users;
 
 namespace Heimdall.Application.Sessions;
@@ -33,6 +34,28 @@ public sealed record ValidSession(Session Session, User User);
 /// <param name="User">The user of the session.</param>
 /// <param name="Live">True when the session passes every rule of <see cref="Session.IsValid"/>.</param>
 public sealed record ListedSession(string SessionId, Session Session, User User, bool Live);
+
+/// <summary>What <c>/authorize</c> does next for one request and one session list.</summary>
+public enum SessionChoiceKind
+{
+    /// <summary>A live session serves the request.</summary>
+    Session,
+
+    /// <summary>The user must enter credentials: no session fits, or the request asks for a new sign-in.</summary>
+    SignIn,
+
+    /// <summary>The user must choose an account on the account picker.</summary>
+    Picker,
+}
+
+/// <param name="Kind">The next step.</param>
+/// <param name="Session">The session that serves the request, for <see cref="SessionChoiceKind.Session"/>.</param>
+public sealed record SessionChoice(SessionChoiceKind Kind, ValidSession? Session = null)
+{
+    public static SessionChoice SignIn { get; } = new(SessionChoiceKind.SignIn);
+
+    public static SessionChoice Picker { get; } = new(SessionChoiceKind.Picker);
+}
 
 /// <summary>
 /// Login sessions at Heimdall (D11 to D13, D18). The cookie holds the browser's session list: up to five random
@@ -164,14 +187,109 @@ public sealed class SessionService
     }
 
     /// <summary>
+    /// Chooses the session of the browser's list that serves an authorization request (D51), and records its activity.
+    /// One query for the list.
+    /// </summary>
+    public async Task<SessionChoice> ChooseAsync(RequestContext context, AuthorizationRequest request, string? cookie, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var listed = await ListAsync(context, cookie, cancellationToken).ConfigureAwait(false);
+        var now = _time.GetUtcNow();
+        var choice = Choose(request, listed, now);
+        if (choice.Session is { } chosen && now - chosen.Session.LastSeenAt >= TouchInterval)
+        {
+            chosen.Session.Touch(now);
+            await _sessions.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        return choice;
+    }
+
+    /// <summary>
+    /// D51, the order of the choice. (1) The user's choice for this request: a selection on the account picker, or
+    /// the one sign-in after the request was created. (2) <c>id_token_hint</c>: the live session of that user.
+    /// (3) <c>login_hint</c>: the live session of the user with that email. (4) No hint: the one live session, or the
+    /// account picker when the list leaves a choice. Heimdall never guesses between accounts. The chosen session
+    /// must also satisfy <c>prompt=login</c> and <c>max_age</c>.
+    /// </summary>
+    public static SessionChoice Choose(AuthorizationRequest request, IReadOnlyList<ListedSession> listed, DateTimeOffset now)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(listed);
+
+        ListedSession? Live(Func<ListedSession, bool> match) => listed.LastOrDefault(l => l.Live && match(l));
+
+        // (1) The selection is stored on the request, so it was made for this request and after its creation. It counts
+        // only while that session is live and in this browser's list: a sid alone authenticates nothing (D29).
+        var candidate = request.SelectedSid is { } sid ? Live(l => string.Equals(l.Session.Sid, sid, StringComparison.Ordinal)) : null;
+        if (candidate is null)
+        {
+            // A sign-in after the request was created is the user's choice too: the user typed the credentials of that
+            // account on the page of this request. An id_token_hint still limits it: the client asked for one user.
+            var fresh = listed
+                .Where(l => l.Live && l.Session.AuthTime > request.CreatedAt && (request.HintUserId is not { } hinted || l.User.Id == hinted))
+                .ToList();
+            if (fresh.Count > 1)
+            {
+                return SessionChoice.Picker;
+            }
+
+            candidate = fresh.SingleOrDefault();
+        }
+
+        if (candidate is null)
+        {
+            if (request.SelectAccount)
+            {
+                // prompt=select_account: only the picker answers. An empty list has nothing to pick from.
+                return listed.Count == 0 ? SessionChoice.SignIn : SessionChoice.Picker;
+            }
+
+            if (request.HintUserId is { } hintUserId)
+            {
+                candidate = Live(l => l.User.Id == hintUserId);
+            }
+            else if (request.LoginHint is { } loginHint)
+            {
+                var email = User.NormalizeEmail(loginHint);
+                candidate = Live(l => string.Equals(l.User.EmailNormalized, email, StringComparison.Ordinal));
+            }
+            else if (request.ForceLogin || listed.Count == 0)
+            {
+                // prompt=login asks for credentials anyway. The sign-in then records the selection.
+                return SessionChoice.SignIn;
+            }
+            else if (listed.Count == 1 && listed[0].Live)
+            {
+                candidate = listed[0];
+            }
+            else
+            {
+                // Several accounts, or only ended ones: the user chooses.
+                return SessionChoice.Picker;
+            }
+
+            if (candidate is null)
+            {
+                // The hint names no live session of this browser.
+                return SessionChoice.SignIn;
+            }
+        }
+
+        return request.AcceptsSession(candidate.Session, now)
+            ? new SessionChoice(SessionChoiceKind.Session, new ValidSession(candidate.Session, candidate.User))
+            : SessionChoice.SignIn;
+    }
+
+    /// <summary>
     /// Returns a live session of the browser's list and its user, and records its activity. A session is live when
     /// every rule holds (see <see cref="Session.IsValid"/>): the tenant matches, the user is active, the password did
     /// not change since sign-in, and neither the idle nor the absolute limit passed.
     /// </summary>
     /// <remarks>
-    /// With several live sessions, this returns the session of the latest sign-in. This is a step of the account
-    /// picker build (#41): the next step makes <c>/authorize</c> choose by the user's selection and the client's hints.
-    /// A sign-out does not use this method. It ends every live session of the list.
+    /// With several live sessions, this returns the session of the latest sign-in. Only <c>/session/v1/me</c> uses it.
+    /// <c>/authorize</c> and the consent API choose with <see cref="ChooseAsync"/>. A sign-out ends every live session.
     /// </remarks>
     public async Task<ValidSession?> ValidateAsync(RequestContext context, string? cookie, CancellationToken cancellationToken)
     {
