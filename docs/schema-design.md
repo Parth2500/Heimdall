@@ -1,6 +1,6 @@
 # Heimdall Schema Design (Phase 0)
 
-This document defines the PostgreSQL schema. It uses the terms in the glossary of `docs/threat-model.md`. Decision IDs (D1 to D49) refer to that document.
+This document defines the PostgreSQL schema. It uses the terms in the glossary of `docs/threat-model.md`. Decision IDs (D1 to D50) refer to that document.
 
 The document has no C# code. The entities and the migrations are written by hand, from this design.
 
@@ -310,6 +310,14 @@ WHERE  tenant_id = @tenant AND request_uri_hash = @hash
 RETURNING *;
 ```
 The client condition is in the statement, so a `request_uri` sent with another `client_id` does not use up the request. A concurrent second use waits on the row lock, then finds the hash cleared and matches no row.
+
+**Sign in again** (`/session/v1/login`, D13). The user already has a live session in the browser's session list. One statement replaces the key of the row:
+```sql
+UPDATE sessions
+SET    id_hash = @new_hash, auth_time = @now, last_seen_at = @now, absolute_expires_at = @now + @absolute
+WHERE  tenant_id = @tenant AND id_hash = @old_hash AND revoked_at IS NULL;
+```
+One row means success. The old session ID stops working at once, and the `sid` stays. Zero rows means that a sign-out ended the session first. Then the sign-in starts a new session with a new `sid`.
 
 **End a session** (`/oauth/v1/logout`, `/session/v1/logout`, D33). Three statements in one transaction:
 ```sql

@@ -7,16 +7,23 @@ namespace Heimdall.Application.Sessions;
 /// <summary>The <c>sessions</c> table of one tenant. Rows are found by the hash of the session ID (D12).</summary>
 public interface ISessionStore
 {
-    /// <summary>The session with this ID hash in the tenant, tracked for change, or null.</summary>
-    Task<Session?> FindAsync(Guid tenantId, TokenHash idHash, CancellationToken cancellationToken);
-
     /// <summary>
-    /// The session and its user in one query, both tracked for change, or null when either is missing. Session
-    /// validation runs on many requests, so it costs one round trip, not two.
+    /// The sessions with these ID hashes in the tenant, each with its user, tracked for change. A hash with no row, or
+    /// with no user, gives no entry. Validation of a session list runs on many requests, so it costs one round trip
+    /// for the whole list.
     /// </summary>
-    Task<(Session Session, User User)?> FindWithUserAsync(Guid tenantId, TokenHash idHash, CancellationToken cancellationToken);
+    Task<IReadOnlyList<(Session Session, User User)>> FindWithUsersAsync(
+        Guid tenantId,
+        IReadOnlyList<TokenHash> idHashes,
+        CancellationToken cancellationToken);
 
     void Add(Session session);
+
+    /// <summary>
+    /// Replaces a session by its re-authenticated form (<see cref="Session.Reauthenticate"/>) in one conditional
+    /// statement. False when the session was revoked in the meantime, so nothing changed.
+    /// </summary>
+    Task<bool> ReplaceAsync(Session session, Session reauthenticated, CancellationToken cancellationToken);
 
     Task SaveChangesAsync(CancellationToken cancellationToken);
 }

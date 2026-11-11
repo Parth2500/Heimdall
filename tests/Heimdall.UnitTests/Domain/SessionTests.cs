@@ -124,4 +124,45 @@ public class SessionTests
         Assert.True(session.IsAuthenticatedWithin(TimeSpan.FromMinutes(30), Now.AddMinutes(30)));
         Assert.False(session.IsAuthenticatedWithin(TimeSpan.FromMinutes(10), Now.AddMinutes(30)));
     }
+
+    [Fact]
+    public void Reauthentication_keeps_the_sid_and_replaces_the_id()
+    {
+        var user = NewUser();
+        var session = NewSession(user);
+        session.Touch(Now.AddMinutes(5));
+        var later = Now.AddMinutes(10);
+
+        var again = session.Reauthenticate(TokenHash.Compute("new-session-id"), Absolute, later);
+
+        Assert.Equal(TokenHash.Compute("new-session-id"), again.IdHash);
+        Assert.Equal(session.Sid, again.Sid);
+        Assert.Equal(session.TenantId, again.TenantId);
+        Assert.Equal(session.UserId, again.UserId);
+        Assert.Equal(Now, again.CreatedAt);
+        Assert.Equal(later, again.AuthTime);
+        Assert.Equal(later, again.LastSeenAt);
+        Assert.Equal(later + Absolute, again.AbsoluteExpiresAt);
+        Assert.Null(again.RevokedAt);
+        Assert.True(again.IsValid(TenantId, user, Idle, later));
+        Assert.True(again.IsAuthenticatedWithin(TimeSpan.Zero, later));
+    }
+
+    [Fact]
+    public void Reauthentication_of_a_revoked_session_is_refused()
+    {
+        var session = NewSession(NewUser());
+        session.Revoke(Now);
+
+        Assert.Throws<DomainException>(() => session.Reauthenticate(TokenHash.Compute("new-session-id"), Absolute, Now));
+    }
+
+    [Fact]
+    public void Reauthentication_needs_a_new_id_and_a_positive_lifetime()
+    {
+        var session = NewSession(NewUser());
+
+        Assert.Throws<DomainException>(() => session.Reauthenticate(TokenHash.Compute("session-id"), Absolute, Now));
+        Assert.ThrowsAny<Exception>(() => session.Reauthenticate(TokenHash.Compute("new-session-id"), TimeSpan.Zero, Now));
+    }
 }

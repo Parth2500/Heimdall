@@ -60,7 +60,7 @@ The database enforces the most important rules a second time (unique indexes, ch
 
 | Entity | Rules | Reference |
 |---|---|---|
-| `Session` | Stores only the hash of the session ID. It is valid only when: not revoked, the tenant matches the request, the user matches and is active, it was created after the last password change, and neither the idle nor the absolute limit has passed. Activity never passes the absolute limit. `max_age` compares with the last sign-in, not the last activity. It has a public `sid` of 22 base64url characters (`SessionSid`), which is not the cookie secret. | D11 to D13, D18, D29 |
+| `Session` | Stores only the hash of the session ID. It is valid only when: not revoked, the tenant matches the request, the user matches and is active, it was created after the last password change, and neither the idle nor the absolute limit has passed. Activity never passes the absolute limit. `max_age` compares with the last sign-in, not the last activity. It has a public `sid` of 22 base64url characters (`SessionSid`), which is not the cookie secret. `Reauthenticate` gives the same session a new ID hash, a new sign-in time, and a new absolute limit. It keeps the `sid` and the creation time. It refuses a revoked session and an unchanged ID. | D11 to D13, D18, D29 |
 | `AuthorizationRequest` (consent) | Records one consent decision and the user who made it. A decision counts only for that user. A later decision replaces it. | Consent page, Spoofing |
 | `Consent` | Covers a request only if active and every requested scope is in it. A new approval adds scopes to an active consent. After a revocation, a new approval starts with only the new scopes, so old scopes do not come back. | `/authorize`, Repudiation |
 

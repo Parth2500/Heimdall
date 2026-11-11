@@ -245,6 +245,13 @@ public sealed class LogoutTests
     {
         await using var flow = await SetUpAsync();
         var old = await SignInToClientAsync(flow);
+
+        // The user signs out and in again: a new session with a new sid.
+        using (var signOut = await flow.Browser.LogoutAsync())
+        {
+            Assert.Equal(HttpStatusCode.OK, signOut.StatusCode);
+        }
+
         using (var again = await flow.Browser.LoginAsync(Email, Password))
         {
             Assert.Equal(HttpStatusCode.NoContent, again.StatusCode);
@@ -254,6 +261,25 @@ public sealed class LogoutTests
 
         Assert.StartsWith("/account/logout?logout_request=", response.Headers.Location!.OriginalString, StringComparison.Ordinal);
         Assert.True(await SessionIsValidAsync(flow));
+    }
+
+    [DockerFact]
+    public async Task Sign_out_after_a_second_sign_in_revokes_the_families_from_before_it()
+    {
+        // The account picker design, P4: a second sign-in of the same user keeps the session and its sid. So the
+        // families from before it still belong to a session that a sign-out ends (D33).
+        await using var flow = await SetUpAsync();
+        var first = await SignInToClientAsync(flow);
+        using (var again = await flow.Browser.LoginAsync(Email, Password))
+        {
+            Assert.Equal(HttpStatusCode.NoContent, again.StatusCode);
+        }
+
+        using var response = await LogoutAsync(flow, ("id_token_hint", first.IdToken), ("post_logout_redirect_uri", Bye));
+
+        Assert.Equal(Bye, response.Headers.Location!.OriginalString);
+        Assert.False(await SessionIsValidAsync(flow));
+        Assert.All(await FamiliesAsync(flow), f => Assert.Equal(FamilyRevocationReason.UserLogout, f.RevocationReason));
     }
 
     [DockerFact]

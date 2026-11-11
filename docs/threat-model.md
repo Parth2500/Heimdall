@@ -47,6 +47,10 @@ Each term has one meaning in this document. Do not use a synonym.
 | Client origin | The origin (scheme, host, and port) of an `https` redirect URI of an active public client. A browser page on a client origin may read the responses of `/token`, `/revoke`, and `/userinfo` (D23). |
 | CSP nonce | A random value that Heimdall creates for each page response. Only script and style elements that carry it can run. |
 | Backend-for-frontend (BFF) | A server part of a browser app. It keeps the tokens, and the browser gets only a cookie. |
+| Session | One sign-in of one user in one browser. It has one cookie secret (the session ID) and one public `sid`. |
+| Session list | The sessions that one browser's cookie names. At most five. |
+| Live session | A session that passes every validity rule: not revoked, the tenant and the user match, the user is active, and no limit has passed. |
+| Ended session | A session that is not live. |
 | Grant rejection | The grant refuses a well-formed request, for example for a wrong secret or a scope that is not allowed. Heimdall audits it. |
 
 ## Trust boundaries
@@ -365,15 +369,18 @@ Additional decisions for this boundary:
 | ID | Decision | Reason |
 |---|---|---|
 | D11 | The session cookie uses the `__Host-` prefix and the flags `Secure`, `HttpOnly`, and `SameSite=Lax`. It has no `Domain` attribute. | `Lax` is required. A client sends the user to `/authorize` with a top-level cross-site navigation. `Strict` would drop the cookie, and the user would appear signed out. |
-| D12 | The cookie holds a random 256-bit session ID. The server stores the session and a hash of the ID. | The browser holds no user data. The server can end a session at any time. |
-| D13 | Heimdall issues a new session ID at sign-in. | This stops session fixation. |
+| D12 | The cookie holds the session list of the browser: one to five session IDs, joined by `.`. Each ID is 256 random bits and names one session of one user. The server stores each session and a hash of its ID. Heimdall refuses a malformed cookie value as a whole, before the database. | The browser holds no user data. The server can end a session at any time. One browser can hold several accounts (#41). Base64url text has no `.`, so the split is exact. |
+| D13 | Heimdall issues a new session ID at each sign-in. It never adopts a session ID from the request. When the user already has a live session in the list, that session continues: it gets the new ID, a new `auth_time`, and a new absolute lifetime, and it keeps its `sid`. The old ID stops working in the same statement. Sessions of other users stay in the list. | This stops session fixation. The same `sid` keeps the token families of the session linked to a session that a sign-out can end (D33). |
 | D14 | A password has at least 12 characters and at most 128. Heimdall rejects passwords from a breached-password list. It has no composition rules. | This follows NIST SP 800-63B. Length and the breach check protect users better than character rules. |
+| D50 | A session list holds at most five sessions. This rule has no setting. A sign-in to a full list first drops the ended sessions, oldest entry first. If five live sessions remain, Heimdall refuses the sign-in with `session_limit`, after it checks the password. | The cap limits the cookie size and the query for each request. Heimdall never ends a live session without the user's request. The refusal comes after the password check, so it shows nothing about an account to a caller who does not know the password. |
 
 | STRIDE | Threat | Mitigation |
 |---|---|---|
 | **Spoofing** | Credential stuffing: an attacker tries leaked passwords from other sites. | Heimdall limits sign-in attempts for each IP. It throttles failures for each account and source: after 5 failures, the wait doubles with each failure, up to 15 minutes. During a wait, Heimdall does not check the password, so guessing makes no progress. The attempt costs one dummy hash and gets the generic failure, so a throttled account looks like any failed sign-in. It does not lock the account (see denial of service). It checks passwords against a breached-password list (D14). Multi-factor authentication with WebAuthn comes in Phase 3. |
 | Spoofing | An attacker learns which accounts exist from the login error or the response time. | Heimdall returns one generic error for an unknown user and a wrong password. For an unknown user, it still computes an Argon2id hash against a dummy value, so the response time is the same. |
-| Spoofing | Session fixation: an attacker sets a known session ID before sign-in. | Heimdall issues a new session ID at sign-in (D13). It never accepts a session ID from the URL. |
+| Spoofing | Session fixation: an attacker sets a known session ID before sign-in. | Heimdall issues a new session ID at each sign-in and adopts none from the request (D13). It never accepts a session ID from the URL. |
+| Spoofing | An attacker adds a session of the attacker's own account to the victim's session list. The victim then works in the attacker's account. | Only the tenant origin can set a `__Host-` cookie, over TLS (D11). The risk that remains needs script execution on the tenant origin. The account picker (#41) shows the email of each account. |
+| Denial of service | A cookie with many session IDs causes a large query. | Heimdall refuses a value with more than five IDs before the database (D12, D50). |
 | Spoofing | An attacker steals the session cookie. | `HttpOnly` blocks script access. `Secure` and HSTS (D1) block network capture. The session has an idle timeout and an absolute lifetime. |
 | Spoofing | Login CSRF: an attacker signs the victim in to the attacker's account. | The login form has an anti-forgery token. `SameSite=Lax` also applies (D11). |
 | Spoofing | CSRF on the JSON login API that the Angular page calls (`/session/v1/login` and `/logout`). | Three layers. The page sends the antiforgery token from the `__Host-XSRF-TOKEN` cookie in the `X-XSRF-TOKEN` header (double-submit). The API accepts only JSON, and a cross-site script needs a CORS preflight for JSON, which Heimdall never allows. A browser `Origin` header must equal the tenant origin. |

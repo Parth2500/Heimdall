@@ -46,7 +46,7 @@ public sealed class Session
     public DateTimeOffset LastSeenAt { get; private set; }
 
     /// <summary>When the user last entered credentials. Used for <c>max_age</c> and the <c>auth_time</c> claim.</summary>
-    public DateTimeOffset AuthTime { get; }
+    public DateTimeOffset AuthTime { get; private init; }
 
     public DateTimeOffset AbsoluteExpiresAt { get; }
 
@@ -81,6 +81,31 @@ public sealed class Session
             && CreatedAt >= user.PasswordChangedAt
             && now < AbsoluteExpiresAt
             && now < LastSeenAt + idleTimeout;
+    }
+
+    /// <summary>
+    /// The same session after the user entered credentials again in the same browser. It has a new cookie secret, so a
+    /// secret known before this sign-in is worthless (D13). The <c>sid</c> stays, so the token families of the session
+    /// stay linked to a session that a sign-out can end (D33). The absolute lifetime starts again.
+    /// </summary>
+    public Session Reauthenticate(TokenHash newIdHash, TimeSpan absoluteLifetime, DateTimeOffset now)
+    {
+        Guard.Positive(absoluteLifetime, nameof(absoluteLifetime));
+        if (RevokedAt is not null)
+        {
+            throw new DomainException("A revoked session cannot be used.");
+        }
+
+        if (newIdHash == IdHash)
+        {
+            throw new DomainException("A sign-in needs a new session ID.");
+        }
+
+        return new Session(newIdHash, Sid, TenantId, UserId, CreatedAt, now + absoluteLifetime)
+        {
+            AuthTime = now,
+            LastSeenAt = now,
+        };
     }
 
     /// <summary>True when the user entered credentials no longer than <paramref name="maxAge"/> ago.</summary>

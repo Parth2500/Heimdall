@@ -31,6 +31,13 @@ public sealed class SessionEndpointTests
         return json.RootElement.GetProperty("error").GetString();
     }
 
+    private static async Task<List<Heimdall.Domain.Sessions.Session>> SessionsAsync(HeimdallApiFactory api, TestTenant tenant)
+    {
+        await using var scope = api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<TenantScope>().Set(tenant.Tenant.Id);
+        return await scope.ServiceProvider.GetRequiredService<HeimdallDbContext>().Sessions.AsNoTracking().OrderBy(s => s.CreatedAt).ToListAsync();
+    }
+
     private async Task<(HeimdallApiFactory Api, TestTenant Tenant)> SetUpAsync()
     {
         var api = new HeimdallApiFactory(_postgres);
@@ -162,6 +169,99 @@ public sealed class SessionEndpointTests
         using var replay = new BrowserSession(api, tenant.Host);
         replay.Cookies[SessionEndpoints.SessionCookie] = oldId;
         using var me = await replay.MeAsync();
+        Assert.Equal(HttpStatusCode.Unauthorized, me.StatusCode);
+    }
+
+    [DockerFact]
+    public async Task Sign_in_again_keeps_the_sid_and_replaces_the_session_id()
+    {
+        // The account picker design, P4: one conditional UPDATE replaces the key of the row.
+        var (api, tenant) = await SetUpAsync();
+        await using var _ = api;
+        using var browser = new BrowserSession(api, tenant.Host);
+        using var first = await browser.LoginAsync(Email, Password);
+        var before = await SessionsAsync(api, tenant);
+
+        using var second = await browser.LoginAsync(Email, Password);
+
+        var after = Assert.Single(await SessionsAsync(api, tenant));
+        Assert.Equal(Assert.Single(before).Sid, after.Sid);
+        Assert.NotEqual(before[0].IdHash, after.IdHash);
+        Assert.Equal(Heimdall.Domain.Common.TokenHash.Compute(browser.SessionId!), after.IdHash);
+        Assert.True(after.AuthTime >= before[0].AuthTime);
+        Assert.Null(after.RevokedAt);
+        using var me = await browser.MeAsync();
+        Assert.Equal(HttpStatusCode.OK, me.StatusCode);
+    }
+
+    [DockerFact]
+    public async Task Two_accounts_sign_in_to_one_browser()
+    {
+        var (api, tenant) = await SetUpAsync();
+        await using var _ = api;
+        await api.AddUserAsync(tenant, "bob@example.com", Password);
+        using var browser = new BrowserSession(api, tenant.Host);
+        using var first = await browser.LoginAsync(Email, Password);
+        var aliceId = browser.SessionId!;
+
+        using var second = await browser.LoginAsync("bob@example.com", Password);
+
+        Assert.Equal(HttpStatusCode.NoContent, second.StatusCode);
+        var ids = browser.SessionId!.Split('.');
+        Assert.Equal(2, ids.Length);
+        Assert.Equal(aliceId, ids[0]);
+        var sessions = await SessionsAsync(api, tenant);
+        Assert.Equal(2, sessions.Count);
+        Assert.All(sessions, s => Assert.Null(s.RevokedAt));
+
+        // The session of the latest sign-in answers, until /authorize chooses by selection (#41, next step).
+        using var me = await browser.MeAsync();
+        using var json = JsonDocument.Parse(await me.Content.ReadAsStringAsync());
+        Assert.Equal("bob@example.com", json.RootElement.GetProperty("email").GetString());
+
+        // Each ID alone is still one valid session.
+        using var alone = new BrowserSession(api, tenant.Host);
+        alone.Cookies[SessionEndpoints.SessionCookie] = aliceId;
+        using var aliceMe = await alone.MeAsync();
+        using var aliceJson = JsonDocument.Parse(await aliceMe.Content.ReadAsStringAsync());
+        Assert.Equal(Email, aliceJson.RootElement.GetProperty("email").GetString());
+    }
+
+    [DockerFact]
+    public async Task Sixth_account_is_refused_and_the_cookie_stays()
+    {
+        var (api, tenant) = await SetUpAsync();
+        await using var _ = api;
+        using var browser = new BrowserSession(api, tenant.Host);
+        for (var i = 0; i < 5; i++)
+        {
+            await api.AddUserAsync(tenant, $"user{i}@example.com", Password);
+            using var login = await browser.LoginAsync($"user{i}@example.com", Password);
+            Assert.Equal(HttpStatusCode.NoContent, login.StatusCode);
+        }
+
+        var cookie = browser.SessionId!;
+
+        using var sixth = await browser.LoginAsync(Email, Password);
+
+        Assert.Equal(HttpStatusCode.Conflict, sixth.StatusCode);
+        Assert.Equal("session_limit", await ErrorOf(sixth));
+        Assert.Equal(cookie, browser.SessionId);
+        Assert.Equal(5, (await SessionsAsync(api, tenant)).Count);
+    }
+
+    [DockerFact]
+    public async Task Cookie_with_one_malformed_id_is_no_session()
+    {
+        var (api, tenant) = await SetUpAsync();
+        await using var _ = api;
+        using var browser = new BrowserSession(api, tenant.Host);
+        using var login = await browser.LoginAsync(Email, Password);
+
+        using var replay = new BrowserSession(api, tenant.Host);
+        replay.Cookies[SessionEndpoints.SessionCookie] = browser.SessionId + ".not-a-session-id";
+        using var me = await replay.MeAsync();
+
         Assert.Equal(HttpStatusCode.Unauthorized, me.StatusCode);
     }
 

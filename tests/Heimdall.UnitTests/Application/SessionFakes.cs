@@ -17,24 +17,43 @@ internal sealed class InMemorySessionStore : ISessionStore
 
     public int Queries { get; private set; }
 
-    public Task<Session?> FindAsync(Guid tenantId, TokenHash idHash, CancellationToken cancellationToken)
-    {
-        Queries++;
-        return Task.FromResult(Sessions.SingleOrDefault(s => s.TenantId == tenantId && s.IdHash == idHash));
-    }
-
     /// <summary>The users to join with, as the real store joins the users table.</summary>
     public required InMemoryUserStore Users { get; init; }
 
-    public Task<(Session Session, User User)?> FindWithUserAsync(Guid tenantId, TokenHash idHash, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<(Session Session, User User)>> FindWithUsersAsync(
+        Guid tenantId,
+        IReadOnlyList<TokenHash> idHashes,
+        CancellationToken cancellationToken)
     {
         Queries++;
         var found =
             from s in Sessions
-            where s.TenantId == tenantId && s.IdHash == idHash
+            where s.TenantId == tenantId && idHashes.Contains(s.IdHash)
             join u in Users.Users on new { s.TenantId, Id = s.UserId } equals new { u.TenantId, u.Id }
-            select ((Session Session, User User)?)(s, u);
-        return Task.FromResult(found.SingleOrDefault());
+            select (s, u);
+        return Task.FromResult<IReadOnlyList<(Session Session, User User)>>(found.ToList());
+    }
+
+    /// <summary>When true, the next replace finds the session revoked, as after a concurrent sign-out.</summary>
+    public bool LoseNextReplace { get; set; }
+
+    /// <summary>The conditions of the conditional UPDATE in <c>EfSessionStore</c>.</summary>
+    public Task<bool> ReplaceAsync(Session session, Session reauthenticated, CancellationToken cancellationToken)
+    {
+        if (LoseNextReplace)
+        {
+            LoseNextReplace = false;
+            session.Revoke(reauthenticated.AuthTime);
+        }
+
+        var index = Sessions.FindIndex(s => s.TenantId == session.TenantId && s.IdHash == session.IdHash && s.RevokedAt is null);
+        if (index < 0)
+        {
+            return Task.FromResult(false);
+        }
+
+        Sessions[index] = reauthenticated;
+        return Task.FromResult(true);
     }
 
     public void Add(Session session) => Sessions.Add(session);

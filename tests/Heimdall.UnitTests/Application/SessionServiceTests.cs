@@ -42,8 +42,17 @@ public class SessionServiceTests
 
     private RequestContext Context => new(_tenant, "https://acme.example.com", "corr-1", IPAddress.Parse("203.0.113.7"), "Firefox/140");
 
-    private Task<SignInResult> SignIn(string password = Password, string? existing = null, RequestContext? context = null) =>
-        _service.SignInAsync(context ?? Context, "alice@example.com", password, existing, CancellationToken.None);
+    private Task<SignInResult> SignIn(string password = Password, string? existing = null, RequestContext? context = null, string email = "alice@example.com") =>
+        _service.SignInAsync(context ?? Context, email, password, existing, CancellationToken.None);
+
+    private User AddUser(string email)
+    {
+        var user = User.Create(Guid.CreateVersion7(), _tenant.Id, email, FakePasswordHasher.HashOf(Password), Now);
+        _users.Add(user);
+        return user;
+    }
+
+    private Task<IReadOnlyList<ListedSession>> List(string? cookie) => _service.ListAsync(Context, cookie, CancellationToken.None);
 
     private Task<ValidSession?> Validate(string? sessionId) => _service.ValidateAsync(Context, sessionId, CancellationToken.None);
 
@@ -96,17 +105,207 @@ public class SessionServiceTests
     }
 
     [Fact]
-    public async Task Sign_in_ends_the_previous_session_of_the_browser()
+    public async Task Sign_in_again_keeps_the_session_and_replaces_its_id()
     {
-        // D13, session fixation: an ID that existed before the sign-in must not survive it.
+        // D13, session fixation: an ID that existed before the sign-in must not survive it. The sid stays, so the
+        // token families of the session stay linked to a session that a sign-out can end (D33).
         var first = await SignIn();
+        var sid = _sessions.Sessions[0].Sid;
+        var firstHash = _sessions.Sessions[0].IdHash;
         _time.Advance(TimeSpan.FromMinutes(2));
 
-        var second = await SignIn(existing: first.SessionId);
+        var second = await SignIn(existing: first.Cookie);
 
-        Assert.Equal(Now.AddMinutes(2), _sessions.Sessions[0].RevokedAt);
+        var session = Assert.Single(_sessions.Sessions);
+        Assert.Equal(sid, session.Sid);
+        Assert.Equal(TokenHash.Compute(second.SessionId!), session.IdHash);
+        Assert.Equal(Now.AddMinutes(2), session.AuthTime);
+        Assert.Equal(Now.AddMinutes(2), session.LastSeenAt);
+        Assert.Equal(Now, session.CreatedAt);
+        Assert.Equal(Now.AddMinutes(2) + TenantSettings.Default.SessionAbsolute, session.AbsoluteExpiresAt);
+        Assert.Equal(second.SessionId, second.Cookie);
         Assert.Null(await Validate(first.SessionId));
-        Assert.NotNull(await Validate(second.SessionId));
+        Assert.NotNull(await Validate(second.Cookie));
+
+        Assert.Single(_audit.Events, e => e.Type == AuditEventTypes.SessionStarted);
+        var again = _audit.Events.Single(e => e.Type == AuditEventTypes.SessionReauthenticated);
+        Assert.Equal(_user.Id, again.SubjectUserId);
+        Assert.Equal(Convert.ToHexStringLower(session.IdHash.AsSpan()), again.Data["session_hash"]);
+        Assert.Equal(Convert.ToHexStringLower(firstHash.AsSpan()), again.Data["previous_session_hash"]);
+        Assert.DoesNotContain(second.SessionId, again.Data.Values);
+    }
+
+    [Fact]
+    public async Task Sign_in_again_after_a_concurrent_sign_out_starts_a_new_session()
+    {
+        var first = await SignIn();
+        var sid = _sessions.Sessions[0].Sid;
+        _sessions.LoseNextReplace = true;
+
+        var second = await SignIn(existing: first.Cookie);
+
+        Assert.Equal(2, _sessions.Sessions.Count);
+        Assert.NotNull(_sessions.Sessions[0].RevokedAt);
+        Assert.NotEqual(sid, _sessions.Sessions[1].Sid);
+        Assert.Equal(second.SessionId, second.Cookie);
+        Assert.DoesNotContain(_audit.Events, e => e.Type == AuditEventTypes.SessionReauthenticated);
+    }
+
+    [Fact]
+    public async Task Sign_in_again_to_an_ended_session_starts_a_new_session()
+    {
+        var first = await SignIn();
+        var sid = _sessions.Sessions[0].Sid;
+        _sessions.Sessions[0].Revoke(Now);
+
+        var second = await SignIn(existing: first.Cookie);
+
+        Assert.Equal(2, _sessions.Sessions.Count);
+        Assert.NotEqual(sid, _sessions.Sessions[1].Sid);
+
+        // One row for each account: the ended entry of the same user leaves the list.
+        Assert.Equal(second.SessionId, second.Cookie);
+    }
+
+    [Fact]
+    public async Task Sign_in_of_another_user_keeps_the_other_sessions()
+    {
+        var bob = AddUser("bob@example.com");
+        var first = await SignIn();
+
+        var second = await SignIn(existing: first.Cookie, email: "bob@example.com");
+
+        Assert.Equal(first.SessionId + "." + second.SessionId, second.Cookie);
+        Assert.All(_sessions.Sessions, s => Assert.Null(s.RevokedAt));
+        var listed = await List(second.Cookie);
+        Assert.Equal([_user.Id, bob.Id], listed.Select(l => l.User.Id));
+        Assert.All(listed, l => Assert.True(l.Live));
+        Assert.Equal([first.SessionId, second.SessionId], listed.Select(l => l.SessionId));
+    }
+
+    [Fact]
+    public async Task Sign_in_never_adopts_a_session_id_of_the_request()
+    {
+        // D13: an attacker plants a list. The victim's session gets an ID that the attacker does not know.
+        var planted = new string('A', SessionService.SessionIdLength);
+
+        var result = await SignIn(existing: planted);
+
+        Assert.Equal(result.SessionId, result.Cookie);
+        Assert.DoesNotContain(planted, result.Cookie, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Sign_in_again_moves_the_account_to_the_end_of_the_list()
+    {
+        AddUser("bob@example.com");
+        var alice = await SignIn();
+        var bob = await SignIn(existing: alice.Cookie, email: "bob@example.com");
+
+        var again = await SignIn(existing: bob.Cookie);
+
+        Assert.Equal(bob.SessionId + "." + again.SessionId, again.Cookie);
+        Assert.Equal(2, _sessions.Sessions.Count);
+    }
+
+    [Fact]
+    public async Task Full_list_refuses_a_new_account_and_ends_no_session()
+    {
+        string? cookie = null;
+        for (var i = 0; i < SessionList.MaxSessions; i++)
+        {
+            AddUser($"user{i}@example.com");
+            cookie = (await SignIn(existing: cookie, email: $"user{i}@example.com")).Cookie;
+        }
+
+        var result = await SignIn(existing: cookie);
+
+        Assert.True(result.ListFull);
+        Assert.False(result.Succeeded);
+        Assert.Null(result.Cookie);
+        Assert.Equal(SessionList.MaxSessions, _sessions.Sessions.Count);
+        Assert.All(_sessions.Sessions, s => Assert.Null(s.RevokedAt));
+    }
+
+    [Fact]
+    public async Task Full_list_still_lets_a_listed_account_sign_in_again()
+    {
+        string? cookie = null;
+        for (var i = 0; i < SessionList.MaxSessions; i++)
+        {
+            AddUser($"user{i}@example.com");
+            cookie = (await SignIn(existing: cookie, email: $"user{i}@example.com")).Cookie;
+        }
+
+        var result = await SignIn(existing: cookie, email: "user0@example.com");
+
+        Assert.True(result.Succeeded);
+        Assert.Equal(SessionList.MaxSessions, SessionList.Parse(result.Cookie).Count);
+    }
+
+    [Fact]
+    public async Task Full_list_drops_the_oldest_ended_session_first()
+    {
+        string? cookie = null;
+        var ids = new List<string>();
+        for (var i = 0; i < SessionList.MaxSessions; i++)
+        {
+            AddUser($"user{i}@example.com");
+            var signedIn = await SignIn(existing: cookie, email: $"user{i}@example.com");
+            cookie = signedIn.Cookie;
+            ids.Add(signedIn.SessionId!);
+        }
+
+        _sessions.Sessions[1].Revoke(Now);
+        _sessions.Sessions[3].Revoke(Now);
+
+        var result = await SignIn(existing: cookie);
+
+        Assert.True(result.Succeeded);
+        Assert.Equal(string.Join('.', ids[0], ids[2], ids[3], ids[4], result.SessionId), result.Cookie);
+    }
+
+    [Fact]
+    public async Task List_marks_an_ended_session_and_skips_an_unknown_id()
+    {
+        AddUser("bob@example.com");
+        var alice = await SignIn();
+        var bob = await SignIn(existing: alice.Cookie, email: "bob@example.com");
+        _sessions.Sessions[0].Revoke(Now);
+        var unknown = new string('A', SessionService.SessionIdLength);
+        var queries = _sessions.Queries;
+
+        var listed = await List(unknown + "." + bob.Cookie);
+
+        Assert.Equal([false, true], listed.Select(l => l.Live));
+        Assert.Equal(queries + 1, _sessions.Queries);
+        Assert.Equal(0, _sessions.SaveCount - 2);
+    }
+
+    [Fact]
+    public async Task Validation_uses_the_latest_live_session_of_the_list()
+    {
+        var bob = AddUser("bob@example.com");
+        var alice = await SignIn();
+        var both = await SignIn(existing: alice.Cookie, email: "bob@example.com");
+
+        Assert.Equal(bob.Id, (await Validate(both.Cookie))!.User.Id);
+
+        _sessions.Sessions[1].Revoke(Now);
+        Assert.Equal(_user.Id, (await Validate(both.Cookie))!.User.Id);
+    }
+
+    [Fact]
+    public async Task Validation_of_a_list_costs_one_query()
+    {
+        AddUser("bob@example.com");
+        var alice = await SignIn();
+        var both = await SignIn(existing: alice.Cookie, email: "bob@example.com");
+        var queries = _sessions.Queries;
+
+        await Validate(both.Cookie);
+
+        Assert.Equal(queries + 1, _sessions.Queries);
     }
 
     [Fact]
@@ -126,9 +325,12 @@ public class SessionServiceTests
     {
         var first = await SignIn();
 
-        await SignIn("wrong password here", existing: first.SessionId);
+        var failed = await SignIn("wrong password here", existing: first.SessionId);
 
         Assert.Null(_sessions.Sessions[0].RevokedAt);
+        Assert.Null(failed.Cookie);
+        Assert.False(failed.ListFull);
+        Assert.NotNull(await Validate(first.Cookie));
     }
 
     [Fact]

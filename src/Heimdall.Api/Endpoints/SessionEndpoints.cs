@@ -55,6 +55,7 @@ internal static partial class SessionEndpoints
             .Produces<ErrorBody>(StatusCodes.Status400BadRequest)
             .Produces<ErrorBody>(StatusCodes.Status401Unauthorized)
             .Produces<ErrorBody>(StatusCodes.Status403Forbidden)
+            .Produces<ErrorBody>(StatusCodes.Status409Conflict)
             .Produces<ErrorBody>(StatusCodes.Status415UnsupportedMediaType)
             .Produces(StatusCodes.Status429TooManyRequests)
             .Produces<ErrorBody>(StatusCodes.Status503ServiceUnavailable);
@@ -141,14 +142,20 @@ internal static partial class SessionEndpoints
             return Error(StatusCodes.Status503ServiceUnavailable, "temporarily_unavailable");
         }
 
-        metrics.LoginAttempt(result.Succeeded ? "success" : "failure");
+        metrics.LoginAttempt(result.Succeeded ? "success" : result.ListFull ? "limit" : "failure");
+        if (result.ListFull)
+        {
+            // The credentials were right, so this answer shows nothing that the caller did not prove.
+            return Error(StatusCodes.Status409Conflict, "session_limit");
+        }
+
         if (!result.Succeeded)
         {
             // One answer for an unknown email, a wrong password, and a disabled account.
             return Error(StatusCodes.Status401Unauthorized, "invalid_credentials");
         }
 
-        context.Response.Cookies.Append(SessionCookie, result.SessionId!, SessionCookieOptions());
+        context.Response.Cookies.Append(SessionCookie, result.Cookie!, SessionCookieOptions());
         return Results.NoContent();
     }
 

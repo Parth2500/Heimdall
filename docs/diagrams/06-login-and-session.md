@@ -18,7 +18,13 @@ flowchart TD
     TH -- No --> HV["Argon2id verify (dummy hash if user is unknown)"]
     HV --> OK{"Password correct and user active?"}
     OK -- No --> F["Generic failure, count failure for account and source, audit event"]
-    OK -- Yes --> NS["New session ID, set cookie, audit event"]
+    OK -- Yes --> LS{"Live session of this user in the session list?"}
+    LS -- Yes --> RA["Same session and sid, new session ID"]
+    LS -- No --> FL{"Five live sessions in the list?"}
+    FL -- Yes --> SL["Refuse: session_limit"]
+    FL -- No --> NS["New session, new sid, new session ID"]
+    RA --> CK["Set cookie with the session list, audit event"]
+    NS --> CK
 ```
 
 Failure responses and timing are the same for an unknown user and a wrong password (D5).
@@ -27,9 +33,9 @@ Failure responses and timing are the same for an unknown user and a wrong passwo
 
 ```mermaid
 flowchart LR
-    CK["Cookie __Host-sid: random 256-bit ID, Secure, HttpOnly, SameSite=Lax, no Domain"]
-    SV[("sessions table: hash of ID")]
-    CK -->|"hash on each request"| SV
+    CK["Cookie __Host-Heimdall.Session: 1 to 5 random 256-bit IDs, Secure, HttpOnly, SameSite=Lax, no Domain"]
+    SV[("sessions table: hash of each ID")]
+    CK -->|"hash each ID, one query for each request"| SV
     SV --> CH{"Not revoked, idle limit and absolute limit not passed, created after password change?"}
     CH -- Yes --> OK["Valid session"]
     CH -- No --> NO["Show login page"]
