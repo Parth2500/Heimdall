@@ -247,6 +247,43 @@ public class LogoutServiceTests
     }
 
     [Fact]
+    public async Task Hint_of_one_session_ends_every_live_session_of_the_list()
+    {
+        // The endpoint deletes the cookie after a sign-out, so no session of the list may stay live behind it.
+        var bob = User.Create(Guid.CreateVersion7(), _tenant.Id, "bob@example.com", "hash", Now.AddDays(-1));
+        _users.Add(bob);
+        var bobCookie = Base64Url.EncodeToString(Guid.NewGuid().ToByteArray().Concat(Guid.NewGuid().ToByteArray()).ToArray());
+        _sessions.Add(Session.Start(TokenHash.Compute(bobCookie), OtherSid, _tenant.Id, bob.Id, TimeSpan.FromHours(12), Now));
+        var cookie = SignedIn();
+        var bobFamily = TokenFamily.Start(Guid.CreateVersion7(), _tenant.Id, _spa.Id, bob.Id, Guid.CreateVersion7(), "openid", Lifetimes, Now, sid: OtherSid);
+        _tokens.Families.Add(bobFamily);
+        RegisterHint();
+
+        // The hint names the first entry of the list, not the latest sign-in.
+        var outcome = await EndSession(cookie + "." + bobCookie, ("id_token_hint", Hint));
+
+        Assert.IsType<LogoutSignedOut>(outcome);
+        Assert.NotNull(SessionOf(cookie).RevokedAt);
+        Assert.NotNull(SessionOf(bobCookie).RevokedAt);
+        Assert.NotNull(bobFamily.RevokedAt);
+    }
+
+    [Fact]
+    public async Task Confirmed_sign_out_ends_every_live_session_of_the_list()
+    {
+        var bob = User.Create(Guid.CreateVersion7(), _tenant.Id, "bob@example.com", "hash", Now.AddDays(-1));
+        _users.Add(bob);
+        var bobCookie = Base64Url.EncodeToString(Guid.NewGuid().ToByteArray().Concat(Guid.NewGuid().ToByteArray()).ToArray());
+        _sessions.Add(Session.Start(TokenHash.Compute(bobCookie), OtherSid, _tenant.Id, bob.Id, TimeSpan.FromHours(12), Now));
+        var cookie = SignedIn();
+
+        await _service.ConfirmAsync(Context, bobCookie + "." + cookie, null, CancellationToken.None);
+
+        Assert.NotNull(SessionOf(cookie).RevokedAt);
+        Assert.NotNull(SessionOf(bobCookie).RevokedAt);
+    }
+
+    [Fact]
     public async Task Hint_of_an_older_session_asks_the_user()
     {
         var cookie = SignedIn();

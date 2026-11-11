@@ -171,6 +171,7 @@ public sealed class SessionService
     /// <remarks>
     /// With several live sessions, this returns the session of the latest sign-in. This is a step of the account
     /// picker build (#41): the next step makes <c>/authorize</c> choose by the user's selection and the client's hints.
+    /// A sign-out does not use this method. It ends every live session of the list.
     /// </remarks>
     public async Task<ValidSession?> ValidateAsync(RequestContext context, string? cookie, CancellationToken cancellationToken)
     {

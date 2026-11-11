@@ -129,23 +129,24 @@ public sealed class LogoutService
             target = new LogoutTarget(client.Id, uri, state);
         }
 
-        var session = await _sessions.ValidateAsync(context, sessionId, cancellationToken).ConfigureAwait(false);
-        if (session is null)
+        var live = await LiveSessionsAsync(context, sessionId, cancellationToken).ConfigureAwait(false);
+        if (live.Count == 0)
         {
             // D31: no session, so nothing to end and nothing to confirm.
             return Finish(target);
         }
 
-        // D31: at once only when the hint names this very session. An older hint of the same user does not count.
+        // D31: at once only when the hint names a live session of this browser. An older hint of the same user does
+        // not count.
         var hintMatches = hint is not null
-            && string.Equals(hint.Sid, session.Session.Sid, StringComparison.Ordinal)
-            && string.Equals(hint.Subject, session.User.Id.ToString(), StringComparison.Ordinal);
+            && live.Any(l => string.Equals(hint.Sid, l.Session.Sid, StringComparison.Ordinal)
+                && string.Equals(hint.Subject, l.User.Id.ToString(), StringComparison.Ordinal));
         if (!hintMatches)
         {
             return new LogoutConfirm(target);
         }
 
-        await EndAsync(context, session.Session, ReasonRpInitiated, client!.ClientId, cancellationToken).ConfigureAwait(false);
+        await EndAllAsync(context, live, ReasonRpInitiated, client!.ClientId, cancellationToken).ConfigureAwait(false);
         return Finish(target);
     }
 
@@ -171,14 +172,26 @@ public sealed class LogoutService
             }
         }
 
-        var session = await _sessions.ValidateAsync(context, sessionId, cancellationToken).ConfigureAwait(false);
-        if (session is not null)
-        {
-            await EndAsync(context, session.Session, ReasonUserConfirmed, target is null ? null : client!.ClientId, cancellationToken)
-                .ConfigureAwait(false);
-        }
+        var live = await LiveSessionsAsync(context, sessionId, cancellationToken).ConfigureAwait(false);
+        await EndAllAsync(context, live, ReasonUserConfirmed, target is null ? null : client!.ClientId, cancellationToken).ConfigureAwait(false);
 
         return Finish(target);
+    }
+
+    private async Task<List<ListedSession>> LiveSessionsAsync(RequestContext context, string? cookie, CancellationToken cancellationToken) =>
+        (await _sessions.ListAsync(context, cookie, cancellationToken).ConfigureAwait(false)).Where(l => l.Live).ToList();
+
+    /// <summary>
+    /// Ends every live session of the browser's session list. The caller deletes the cookie after a sign-out, so no
+    /// session may stay live behind it. Each session ends in its own transaction (D33). Sign-out of one account of
+    /// several comes with the account picker (#41, step 3).
+    /// </summary>
+    private async Task EndAllAsync(RequestContext context, List<ListedSession> live, string reason, string? clientId, CancellationToken cancellationToken)
+    {
+        foreach (var listed in live)
+        {
+            await EndAsync(context, listed.Session, reason, clientId, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     private static LogoutOutcome Finish(LogoutTarget? target) =>
