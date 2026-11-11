@@ -50,11 +50,17 @@ public enum SessionChoiceKind
 
 /// <param name="Kind">The next step.</param>
 /// <param name="Session">The session that serves the request, for <see cref="SessionChoiceKind.Session"/>.</param>
-public sealed record SessionChoice(SessionChoiceKind Kind, ValidSession? Session = null)
+/// <param name="NoLiveSession">
+/// For <see cref="SessionChoiceKind.Picker"/>: true when the picker has only signed-out accounts to show. Then nobody
+/// is signed in, and <c>prompt=none</c> answers <c>login_required</c>, not <c>account_selection_required</c>.
+/// </param>
+public sealed record SessionChoice(SessionChoiceKind Kind, ValidSession? Session = null, bool NoLiveSession = false)
 {
     public static SessionChoice SignIn { get; } = new(SessionChoiceKind.SignIn);
 
     public static SessionChoice Picker { get; } = new(SessionChoiceKind.Picker);
+
+    public static SessionChoice PickerOfSignedOutAccounts { get; } = new(SessionChoiceKind.Picker, NoLiveSession: true);
 }
 
 /// <summary>
@@ -187,6 +193,22 @@ public sealed class SessionService
     }
 
     /// <summary>
+    /// Removes one ended session from the browser's session list ("Forget", D55). Returns the new cookie value: empty
+    /// when the list is now empty. Null when the list has no ended session with this <c>sid</c>. A live session must
+    /// be signed out first, so that no session stays live without a browser that holds its ID.
+    /// </summary>
+    public async Task<string?> ForgetAsync(RequestContext context, string? cookie, string? sid, CancellationToken cancellationToken)
+    {
+        var listed = await ListAsync(context, cookie, cancellationToken).ConfigureAwait(false);
+        if (listed.FirstOrDefault(l => !l.Live && string.Equals(l.Session.Sid, sid, StringComparison.Ordinal)) is not { } ended)
+        {
+            return null;
+        }
+
+        return SessionList.Format(listed.Where(l => l != ended).Select(l => l.SessionId));
+    }
+
+    /// <summary>
     /// Chooses the session of the browser's list that serves an authorization request (D51), and records its activity.
     /// One query for the list.
     /// </summary>
@@ -209,9 +231,10 @@ public sealed class SessionService
     /// <summary>
     /// D51, the order of the choice. (1) The user's choice for this request: a selection on the account picker, or
     /// the one sign-in after the request was created. (2) <c>id_token_hint</c>: the live session of that user.
-    /// (3) <c>login_hint</c>: the live session of the user with that email. (4) No hint: the one live session, or the
-    /// account picker when the list leaves a choice. Heimdall never guesses between accounts. The chosen session
-    /// must also satisfy <c>prompt=login</c> and <c>max_age</c>.
+    /// (3) <c>login_hint</c>: the live session of the user with that email. (4) No hint: the one live session. With
+    /// several live sessions, or with only ended ones, the account picker. Heimdall never guesses between accounts,
+    /// and an ended session is never a candidate. The chosen session must also satisfy <c>prompt=login</c> and
+    /// <c>max_age</c>.
     /// </summary>
     public static SessionChoice Choose(AuthorizationRequest request, IReadOnlyList<ListedSession> listed, DateTimeOffset now)
     {
@@ -222,14 +245,15 @@ public sealed class SessionService
 
         // (1) The selection is stored on the request, so it was made for this request and after its creation. It counts
         // only while that session is live and in this browser's list: a sid alone authenticates nothing (D29).
-        var candidate = request.SelectedSid is { } sid ? Live(l => string.Equals(l.Session.Sid, sid, StringComparison.Ordinal)) : null;
+        // An id_token_hint limits every choice (D54): the client asked for one user, so no other user gets the code.
+        bool Hinted(ListedSession l) => request.HintUserId is not { } hinted || l.User.Id == hinted;
+
+        var candidate = request.SelectedSid is { } sid ? Live(l => Hinted(l) && string.Equals(l.Session.Sid, sid, StringComparison.Ordinal)) : null;
         if (candidate is null)
         {
             // A sign-in after the request was created is the user's choice too: the user typed the credentials of that
-            // account on the page of this request. An id_token_hint still limits it: the client asked for one user.
-            var fresh = listed
-                .Where(l => l.Live && l.Session.AuthTime > request.CreatedAt && (request.HintUserId is not { } hinted || l.User.Id == hinted))
-                .ToList();
+            // account on the page of this request.
+            var fresh = listed.Where(l => l.Live && l.Session.AuthTime > request.CreatedAt && Hinted(l)).ToList();
             if (fresh.Count > 1)
             {
                 return SessionChoice.Picker;
@@ -240,10 +264,14 @@ public sealed class SessionService
 
         if (candidate is null)
         {
-            if (request.SelectAccount)
+            var live = listed.Count(l => l.Live);
+            var picker = listed.Count == 0 ? SessionChoice.SignIn : live == 0 ? SessionChoice.PickerOfSignedOutAccounts : SessionChoice.Picker;
+
+            if (request.SelectAccount || request.SelectedSid is not null)
             {
-                // prompt=select_account: only the picker answers. An empty list has nothing to pick from.
-                return listed.Count == 0 ? SessionChoice.SignIn : SessionChoice.Picker;
+                // prompt=select_account: only the user's choice answers. A selection that no longer names a live session
+                // of this list is also no reason to guess: the user chooses again. An empty list has nothing to pick from.
+                return picker;
             }
 
             if (request.HintUserId is { } hintUserId)
@@ -257,17 +285,18 @@ public sealed class SessionService
             }
             else if (request.ForceLogin || listed.Count == 0)
             {
-                // prompt=login asks for credentials anyway. The sign-in then records the selection.
+                // prompt=login asks for credentials anyway. The sign-in is then the choice.
                 return SessionChoice.SignIn;
             }
-            else if (listed.Count == 1 && listed[0].Live)
+            else if (live == 1)
             {
-                candidate = listed[0];
+                // Exactly one account is signed in. Signed-out accounts beside it are no candidates.
+                candidate = Live(_ => true);
             }
             else
             {
-                // Several accounts, or only ended ones: the user chooses.
-                return SessionChoice.Picker;
+                // Several signed-in accounts, or only signed-out ones: the user chooses.
+                return picker;
             }
 
             if (candidate is null)

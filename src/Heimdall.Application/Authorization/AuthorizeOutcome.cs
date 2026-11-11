@@ -29,3 +29,15 @@ public sealed record AuthorizeConsent(Guid RequestId) : AuthorizeOutcome;
 
 /// <summary>Show the account picker. The request is stored, and the page continues it by ID.</summary>
 public sealed record AuthorizeSelectAccount(Guid RequestId) : AuthorizeOutcome;
+
+/// <summary>One row of the account picker.</summary>
+/// <param name="Sid">The public <c>sid</c> of the session. It names the row and authenticates nothing (D29).</param>
+/// <param name="Email">The email address of the account.</param>
+/// <param name="SignedIn">True for a live session. False for an ended one, which the picker shows as "Signed out".</param>
+public sealed record AccountEntry(string Sid, string Email, bool SignedIn);
+
+/// <param name="Accounts">The browser's session list, in the order of the cookie.</param>
+/// <param name="ClientName">The name of the client of the stored request, or null.</param>
+/// <param name="LoginHint">The <c>login_hint</c> of the stored request, or null.</param>
+/// <param name="SignInSid">The <c>sid</c> of the listed account that the stored request names, or null.</param>
+public sealed record AccountList(IReadOnlyList<AccountEntry> Accounts, string? ClientName, string? LoginHint, string? SignInSid);

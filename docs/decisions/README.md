@@ -1,6 +1,6 @@
 # Decision records
 
-The current decisions are in the decision tables: D1 to D54 in the [threat model](../threat-model.md), and U1 to U17 in the [front-end design](../frontend-design.md). A table shows only what is true now.
+The current decisions are in the decision tables: D1 to D55 in the [threat model](../threat-model.md), and U1 to U17 in the [front-end design](../frontend-design.md). A table shows only what is true now.
 
 A decision record keeps the history. Each record is one change to a decision: what was true before, what is true after, and the reason. A correction to the first draft also gets a record. A new decision gets a row in its table and no record.
 
@@ -28,3 +28,4 @@ A decision record keeps the history. Each record is one change to a decision: wh
 | [DR-011](011-private-key-jwt.md) | 2026-10-28 | Confidential clients can use private_key_jwt |
 | [DR-012](012-pnpm-replaces-npm.md) | 2026-10-31 | pnpm replaces npm for the Angular workspace |
 | [DR-013](013-several-sessions-in-one-browser.md) | 2026-11-12 | One browser holds several sessions (#41) |
+| [DR-014](014-sign-out-of-one-account.md) | 2026-11-12 | A sign-out ends one account and keeps the cookie (#41) |

@@ -28,7 +28,7 @@ public sealed class ApiDocumentationTests
         Assert.StartsWith("3.1", document.GetProperty("openapi").GetString(), StringComparison.Ordinal);
         var paths = document.GetProperty("paths").EnumerateObject().Select(p => p.Name).Order(StringComparer.Ordinal);
         Assert.Equal(
-            ["/session/v1/consent", "/session/v1/csrf", "/session/v1/login", "/session/v1/logout", "/session/v1/me"],
+            ["/session/v1/accounts", "/session/v1/consent", "/session/v1/csrf", "/session/v1/forget", "/session/v1/login", "/session/v1/logout", "/session/v1/me", "/session/v1/select"],
             paths);
         var login = document.GetProperty("paths").GetProperty("/session/v1/login").GetProperty("post");
         Assert.True(login.GetProperty("requestBody").GetProperty("content").TryGetProperty("application/json", out _));

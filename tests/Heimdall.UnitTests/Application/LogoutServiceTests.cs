@@ -247,9 +247,9 @@ public class LogoutServiceTests
     }
 
     [Fact]
-    public async Task Hint_of_one_session_ends_every_live_session_of_the_list()
+    public async Task Hint_of_one_session_ends_only_that_session_of_the_list()
     {
-        // The endpoint deletes the cookie after a sign-out, so no session of the list may stay live behind it.
+        // D31: the client of one account signs that account out. The other accounts of the browser stay signed in.
         var bob = User.Create(Guid.CreateVersion7(), _tenant.Id, "bob@example.com", "hash", Now.AddDays(-1));
         _users.Add(bob);
         var bobCookie = Base64Url.EncodeToString(Guid.NewGuid().ToByteArray().Concat(Guid.NewGuid().ToByteArray()).ToArray());
@@ -264,8 +264,39 @@ public class LogoutServiceTests
 
         Assert.IsType<LogoutSignedOut>(outcome);
         Assert.NotNull(SessionOf(cookie).RevokedAt);
+        Assert.Null(SessionOf(bobCookie).RevokedAt);
+        Assert.Null(bobFamily.RevokedAt);
+    }
+
+    [Fact]
+    public async Task Confirmed_sign_out_of_one_account_ends_only_that_session()
+    {
+        var bob = User.Create(Guid.CreateVersion7(), _tenant.Id, "bob@example.com", "hash", Now.AddDays(-1));
+        _users.Add(bob);
+        var bobCookie = Base64Url.EncodeToString(Guid.NewGuid().ToByteArray().Concat(Guid.NewGuid().ToByteArray()).ToArray());
+        _sessions.Add(Session.Start(TokenHash.Compute(bobCookie), OtherSid, _tenant.Id, bob.Id, TimeSpan.FromHours(12), Now));
+        var cookie = SignedIn();
+
+        await _service.ConfirmAsync(Context, bobCookie + "." + cookie, null, OtherSid, CancellationToken.None);
+
+        Assert.Null(SessionOf(cookie).RevokedAt);
         Assert.NotNull(SessionOf(bobCookie).RevokedAt);
-        Assert.NotNull(bobFamily.RevokedAt);
+    }
+
+    [Fact]
+    public async Task Confirmed_sign_out_with_a_sid_outside_the_list_ends_nothing()
+    {
+        // The sid selects only inside the list of the cookie (D29). Bob's session is live in another browser.
+        var bob = User.Create(Guid.CreateVersion7(), _tenant.Id, "bob@example.com", "hash", Now.AddDays(-1));
+        _users.Add(bob);
+        var bobCookie = Base64Url.EncodeToString(Guid.NewGuid().ToByteArray().Concat(Guid.NewGuid().ToByteArray()).ToArray());
+        _sessions.Add(Session.Start(TokenHash.Compute(bobCookie), OtherSid, _tenant.Id, bob.Id, TimeSpan.FromHours(12), Now));
+        var cookie = SignedIn();
+
+        await _service.ConfirmAsync(Context, cookie, null, OtherSid, CancellationToken.None);
+
+        Assert.Null(SessionOf(cookie).RevokedAt);
+        Assert.Null(SessionOf(bobCookie).RevokedAt);
     }
 
     [Fact]
@@ -277,7 +308,7 @@ public class LogoutServiceTests
         _sessions.Add(Session.Start(TokenHash.Compute(bobCookie), OtherSid, _tenant.Id, bob.Id, TimeSpan.FromHours(12), Now));
         var cookie = SignedIn();
 
-        await _service.ConfirmAsync(Context, bobCookie + "." + cookie, null, CancellationToken.None);
+        await _service.ConfirmAsync(Context, bobCookie + "." + cookie, null, null, CancellationToken.None);
 
         Assert.NotNull(SessionOf(cookie).RevokedAt);
         Assert.NotNull(SessionOf(bobCookie).RevokedAt);
@@ -482,7 +513,7 @@ public class LogoutServiceTests
         var cookie = SignedIn();
         var family = AddFamily(_spa);
 
-        var outcome = await _service.ConfirmAsync(Context, cookie, new LogoutTarget(_spa.Id, Bye, "xyz"), CancellationToken.None);
+        var outcome = await _service.ConfirmAsync(Context, cookie, new LogoutTarget(_spa.Id, Bye, "xyz"), null, CancellationToken.None);
 
         Assert.Equal(new LogoutRedirect(Bye, "xyz"), outcome);
         Assert.NotNull(SessionOf(cookie).RevokedAt);
@@ -497,7 +528,7 @@ public class LogoutServiceTests
     {
         var cookie = SignedIn();
 
-        var outcome = await _service.ConfirmAsync(Context, cookie, null, CancellationToken.None);
+        var outcome = await _service.ConfirmAsync(Context, cookie, null, null, CancellationToken.None);
 
         Assert.Same(LogoutSignedOut.Instance, outcome);
         Assert.NotNull(SessionOf(cookie).RevokedAt);
@@ -510,7 +541,7 @@ public class LogoutServiceTests
         var cookie = SignedIn();
         _spa.UpdateLogoutUris([], null);
 
-        var outcome = await _service.ConfirmAsync(Context, cookie, new LogoutTarget(_spa.Id, Bye, null), CancellationToken.None);
+        var outcome = await _service.ConfirmAsync(Context, cookie, new LogoutTarget(_spa.Id, Bye, null), null, CancellationToken.None);
 
         Assert.Same(LogoutSignedOut.Instance, outcome);
         Assert.NotNull(SessionOf(cookie).RevokedAt);
@@ -522,17 +553,17 @@ public class LogoutServiceTests
         var cookie = SignedIn();
         _spa.Disable();
 
-        Assert.Same(LogoutSignedOut.Instance, await _service.ConfirmAsync(Context, cookie, new LogoutTarget(_spa.Id, Bye, null), CancellationToken.None));
+        Assert.Same(LogoutSignedOut.Instance, await _service.ConfirmAsync(Context, cookie, new LogoutTarget(_spa.Id, Bye, null), null, CancellationToken.None));
     }
 
     [Fact]
     public async Task Confirm_for_an_unknown_client_goes_nowhere() =>
-        Assert.Same(LogoutSignedOut.Instance, await _service.ConfirmAsync(Context, null, new LogoutTarget(Guid.CreateVersion7(), Bye, null), CancellationToken.None));
+        Assert.Same(LogoutSignedOut.Instance, await _service.ConfirmAsync(Context, null, new LogoutTarget(Guid.CreateVersion7(), Bye, null), null, CancellationToken.None));
 
     [Fact]
     public async Task Confirm_without_a_session_still_goes_back()
     {
-        var outcome = await _service.ConfirmAsync(Context, null, new LogoutTarget(_spa.Id, Bye, "s"), CancellationToken.None);
+        var outcome = await _service.ConfirmAsync(Context, null, new LogoutTarget(_spa.Id, Bye, "s"), null, CancellationToken.None);
 
         Assert.Equal(new LogoutRedirect(Bye, "s"), outcome);
         Assert.Equal(0, _store.Calls);

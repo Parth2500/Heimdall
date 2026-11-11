@@ -96,4 +96,16 @@ internal sealed class BrowserSession : IDisposable
     public Task<HttpResponseMessage> MeAsync() => SendAsync(HttpMethod.Get, "session/v1/me");
 
     public Task<HttpResponseMessage> LogoutAsync(bool withXsrf = true) => SendAsync(HttpMethod.Post, "session/v1/logout", withXsrf: withXsrf);
+
+    /// <summary>Signs one account out, by the sid of its session.</summary>
+    public Task<HttpResponseMessage> LogoutAsync(string sid) => SendAsync(HttpMethod.Post, "session/v1/logout", JsonContent.Create(new { sid }));
+
+    public Task<HttpResponseMessage> AccountsAsync(string? requestId = null) =>
+        SendAsync(HttpMethod.Get, requestId is null ? "session/v1/accounts" : $"session/v1/accounts?request_id={requestId}");
+
+    public Task<HttpResponseMessage> SelectAsync(string requestId, string sid, bool withXsrf = true) =>
+        SendAsync(HttpMethod.Post, "session/v1/select", JsonContent.Create(new { request_id = requestId, sid }), withXsrf);
+
+    public Task<HttpResponseMessage> ForgetAsync(string sid, bool withXsrf = true) =>
+        SendAsync(HttpMethod.Post, "session/v1/forget", JsonContent.Create(new { sid }), withXsrf);
 }

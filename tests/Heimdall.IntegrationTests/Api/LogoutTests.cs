@@ -155,7 +155,8 @@ public sealed class LogoutTests
         Assert.Equal(HttpStatusCode.Found, response.StatusCode);
         Assert.Equal(Bye + "?state=af0ifjsldkj", response.Headers.Location!.OriginalString);
         Assert.True(response.Headers.CacheControl?.NoStore);
-        Assert.Null(flow.Browser.SessionId);
+        // D55: the cookie stays for the "Signed out" row. Its session ID authenticates nothing now.
+        Assert.NotNull(flow.Browser.SessionId);
         Assert.False(await SessionIsValidAsync(flow));
 
         // D33: the refresh token of that sign-in ends too, and the family records why.
@@ -178,7 +179,12 @@ public sealed class LogoutTests
 
         using var authorize = await AuthorizeAsync(flow);
 
-        Assert.StartsWith("/account/login?request_id=", authorize.Headers.Location!.OriginalString, StringComparison.Ordinal);
+        // The account picker shows the account as "Signed out". A click on it asks for the password (D55).
+        Assert.StartsWith("/account/select-account?request_id=", authorize.Headers.Location!.OriginalString, StringComparison.Ordinal);
+
+        // A client that asks without a page learns only that nobody is signed in.
+        using var silent = await flow.Browser.SendAsync(HttpMethod.Get, authorize.RequestMessage!.RequestUri!.PathAndQuery + "&prompt=none");
+        Assert.Contains("error=login_required", silent.Headers.Location!.OriginalString, StringComparison.Ordinal);
     }
 
     [DockerFact]
@@ -234,7 +240,8 @@ public sealed class LogoutTests
         Assert.Equal(HttpStatusCode.OK, confirm.StatusCode);
         var body = JsonDocument.Parse(await confirm.Content.ReadAsStringAsync()).RootElement;
         Assert.Equal(Bye + "?state=s2", body.GetProperty("redirect_to").GetString());
-        Assert.Null(flow.Browser.SessionId);
+        // D55: the cookie stays for the "Signed out" row. Its session ID authenticates nothing now.
+        Assert.NotNull(flow.Browser.SessionId);
         Assert.False(await SessionIsValidAsync(flow));
         using var refresh = await RefreshAsync(flow, tokens.RefreshToken);
         Assert.Equal(HttpStatusCode.BadRequest, refresh.StatusCode);

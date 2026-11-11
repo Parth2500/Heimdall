@@ -1077,12 +1077,33 @@ public class AuthorizationServiceTests
     }
 
     [Fact]
-    public async Task One_live_session_beside_an_ended_one_shows_the_picker()
+    public async Task One_live_session_beside_an_ended_one_gets_the_code()
+    {
+        // A signed-out account is never a candidate, so exactly one account can serve the request.
+        var (cookie, bob) = TwoAccounts();
+        _sessions.Sessions[0].Revoke(Now);
+
+        Assert.IsType<AuthorizeRedirect>(await Authorize(Valid(), cookie));
+        Assert.Equal(bob.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Prompt_none_with_only_ended_sessions_is_login_required()
     {
         var (cookie, _) = TwoAccounts();
         _sessions.Sessions[0].Revoke(Now);
+        _sessions.Sessions[1].Revoke(Now);
 
-        Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), cookie));
+        AssertErrorRedirect(await Authorize(Valid(("prompt", "none")), cookie), "login_required", "prompt=none without a usable session");
+    }
+
+    [Fact]
+    public async Task Prompt_select_account_with_only_ended_sessions_shows_the_picker()
+    {
+        var cookie = SignedIn();
+        _sessions.Sessions[0].Revoke(Now);
+
+        Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(("prompt", "select_account")), cookie));
     }
 
     [Fact]
@@ -1182,7 +1203,7 @@ public class AuthorizationServiceTests
         await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, BobSid, CancellationToken.None);
         _sessions.Sessions[1].Revoke(Now);
 
-        // Alice is the one live session now, but one ended account is in the list, so the user chooses again.
+        // Alice is the one live session now. The user chose Bob, so Heimdall does not give Alice: the user chooses again.
         Assert.IsType<AuthorizeSelectAccount>(await Resume(picker.RequestId.ToString(), cookie));
         Assert.Empty(_store.Codes);
     }
@@ -1196,9 +1217,10 @@ public class AuthorizationServiceTests
         var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(), alice + "." + bobId));
         await _service.SelectAsync(Context, picker.RequestId.ToString(), alice + "." + bobId, BobSid, CancellationToken.None);
 
-        // Another browser holds only Alice's session and resumes the request.
-        Assert.IsType<AuthorizeRedirect>(await Resume(picker.RequestId.ToString(), alice));
-        Assert.Equal(_user.Id, CodeUser());
+        // Another browser holds only Alice's session and resumes the request. The selection names no session of its
+        // list, so it gets the picker, never Bob's code and never a guess.
+        Assert.IsType<AuthorizeSelectAccount>(await Resume(picker.RequestId.ToString(), alice));
+        Assert.Empty(_store.Codes);
     }
 
     [Fact]
@@ -1492,5 +1514,40 @@ public class AuthorizationServiceTests
 
         Assert.IsType<AuthorizeRedirect>(await Resume(login.RequestId.ToString(), cookie));
         Assert.Equal(bob.Id, CodeUser());
+    }
+
+    [Fact]
+    public async Task Selection_of_another_user_than_the_id_token_hint_is_refused()
+    {
+        // D54: with prompt=select_account the picker shows, but the hint still limits the choice.
+        var (cookie, bob) = TwoAccounts();
+        RegisterHint("hint", bob);
+        var picker = Assert.IsType<AuthorizeSelectAccount>(await Authorize(Valid(("prompt", "select_account"), ("id_token_hint", "hint")), cookie));
+
+        var alice = await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, "sid-for-tests-00000000", CancellationToken.None);
+        Assert.False(alice.IsSuccess);
+        Assert.IsType<AuthorizeSelectAccount>(await Resume(picker.RequestId.ToString(), cookie));
+
+        var hinted = await _service.SelectAsync(Context, picker.RequestId.ToString(), cookie, BobSid, CancellationToken.None);
+        Assert.True(hinted.IsSuccess);
+        Assert.IsType<AuthorizeRedirect>(await Resume(picker.RequestId.ToString(), cookie));
+        Assert.Equal(bob.Id, CodeUser());
+    }
+
+    [Fact]
+    public void Stored_selection_of_another_user_than_the_hint_never_counts()
+    {
+        // The choice checks the hint again, so a selection that reached the request in any way cannot pass it.
+        var bob = AddBob();
+        var request = AuthorizationRequest.Create(
+            Guid.CreateVersion7(), _tenant.Id, _spa.Id, Callback, "openid", null, null, Challenge, false, null, Now, hintUserId: bob.Id);
+        request.Select("sid-for-tests-00000000", Now);
+        var alice = Session.Start(TokenHash.Compute("a"), "sid-for-tests-00000000", _tenant.Id, _user.Id, TimeSpan.FromHours(12), Now);
+        var listed = new List<ListedSession> { new("a", alice, _user, true) };
+
+        var choice = SessionService.Choose(request, listed, Now);
+
+        Assert.Equal(SessionChoiceKind.Picker, choice.Kind);
+        Assert.Null(choice.Session);
     }
 }

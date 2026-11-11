@@ -284,6 +284,12 @@ public sealed class AuthorizationService
             return Result.Failure<bool>(OAuthError.InvalidRequest("no live session with this sid in the session list"));
         }
 
+        // D54: the client named one user with id_token_hint. The picker cannot give the code to another one.
+        if (request.HintUserId is { } hinted && chosen.User.Id != hinted)
+        {
+            return Result.Failure<bool>(OAuthError.InvalidRequest("selection differs from the user of id_token_hint"));
+        }
+
         request.Select(chosen.Session.Sid, now);
         try
         {
@@ -307,6 +313,35 @@ public sealed class AuthorizationService
                 data: new Dictionary<string, string> { ["sid"] = chosen.Session.Sid, ["request_id"] = request.Id.ToString() }),
             cancellationToken).ConfigureAwait(false);
         return Result.Success(true);
+    }
+
+    /// <summary>
+    /// What the account picker and the sign-in page show (D55): the browser's session list, and for a stored request
+    /// the client's name, the <c>login_hint</c>, and the account that must sign in again. An unknown or expired request
+    /// gives the list alone. The resume step then shows the error.
+    /// </summary>
+    public async Task<AccountList> ListAccountsAsync(RequestContext context, string? requestId, string? sessionCookie, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        var listed = await _sessions.ListAsync(context, sessionCookie, cancellationToken).ConfigureAwait(false);
+        var accounts = listed.Select(l => new AccountEntry(l.Session.Sid, l.User.Email, l.Live)).ToList();
+
+        if (!Guid.TryParse(requestId, out var id)
+            || await _store.FindRequestAsync(context.Tenant.Id, id, cancellationToken).ConfigureAwait(false) is not { RequestUriHash: null } request
+            || request.IsExpired(_time.GetUtcNow()))
+        {
+            return new AccountList(accounts, null, null, null);
+        }
+
+        var client = await _clients.FindByPkAsync(context.Tenant.Id, request.ClientPk, cancellationToken).ConfigureAwait(false);
+
+        // The account that the request already names: the user's selection, or the user of the id_token_hint. When the
+        // browser comes to the sign-in page with it, that account must enter its password again.
+        var named = listed.LastOrDefault(l => request.SelectedSid is { } sid
+            ? string.Equals(l.Session.Sid, sid, StringComparison.Ordinal)
+            : l.User.Id == request.HintUserId);
+        return new AccountList(accounts, client?.Name, request.LoginHint, named?.Session.Sid);
     }
 
     /// <summary>An <c>id_token_hint</c> of the request: absent, valid for a user, or not valid.</summary>
@@ -537,9 +572,12 @@ public sealed class AuthorizationService
         var choice = await _sessions.ChooseAsync(context, request, sessionId, cancellationToken).ConfigureAwait(false);
         if (choice.Kind == SessionChoiceKind.Picker)
         {
-            // D51: Heimdall never guesses between accounts, and prompt=none forbids the page.
+            // D51: Heimdall never guesses between accounts, and prompt=none forbids the page. With only signed-out
+            // accounts in the list, nobody is signed in, so the answer is login_required.
             return promptNone
-                ? ErrorRedirect(context, request.RedirectUri, request.State, AccountSelectionRequiredCode, "prompt=none with several accounts and no hint")
+                ? choice.NoLiveSession
+                    ? ErrorRedirect(context, request.RedirectUri, request.State, "login_required", "prompt=none without a usable session")
+                    : ErrorRedirect(context, request.RedirectUri, request.State, AccountSelectionRequiredCode, "prompt=none with several accounts and no hint")
                 : await ShowPageAsync(request, stored, new AuthorizeSelectAccount(request.Id), cancellationToken).ConfigureAwait(false);
         }
 

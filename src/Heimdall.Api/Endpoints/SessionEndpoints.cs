@@ -6,6 +6,7 @@ using Heimdall.Application.Common;
 using Heimdall.Application.Logout;
 using Heimdall.Application.Sessions;
 using Heimdall.Application.Users;
+using Heimdall.Domain.Sessions;
 using Heimdall.Infrastructure.Telemetry;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Http.Features;
@@ -60,7 +61,7 @@ internal static partial class SessionEndpoints
             .Produces(StatusCodes.Status429TooManyRequests)
             .Produces<ErrorBody>(StatusCodes.Status503ServiceUnavailable);
         group.MapPost("/logout", LogoutAsync)
-            .WithSummary("Ends the session (D33). The answer names where the page sends the browser.")
+            .WithSummary("Ends one account of this browser, or every account (D33). The answer names where the page sends the browser.")
             .Accepts<LogoutBody>("application/json")
             .Produces<LogoutResultBody>()
             .Produces<ErrorBody>(StatusCodes.Status400BadRequest)
@@ -69,6 +70,23 @@ internal static partial class SessionEndpoints
             .WithSummary("Returns the signed-in user.")
             .Produces<MeBody>()
             .Produces<ErrorBody>(StatusCodes.Status401Unauthorized);
+        group.MapGet("/accounts", AccountsAsync)
+            .WithSummary("Returns the accounts of this browser, for the account picker. With request_id, also what the stored request names.")
+            .Produces<AccountsBody>();
+        group.MapPost("/select", SelectAsync)
+            .WithSummary("Records the account that the user chose for a stored request. The page then calls /oauth/v1/authorize/resume.")
+            .Accepts<SelectBody>("application/json")
+            .Produces(StatusCodes.Status204NoContent)
+            .Produces<ErrorBody>(StatusCodes.Status400BadRequest)
+            .Produces<ErrorBody>(StatusCodes.Status403Forbidden)
+            .Produces<ErrorBody>(StatusCodes.Status415UnsupportedMediaType);
+        group.MapPost("/forget", ForgetAsync)
+            .WithSummary("Removes one signed-out account from this browser.")
+            .Accepts<ForgetBody>("application/json")
+            .Produces(StatusCodes.Status204NoContent)
+            .Produces<ErrorBody>(StatusCodes.Status400BadRequest)
+            .Produces<ErrorBody>(StatusCodes.Status403Forbidden)
+            .Produces<ErrorBody>(StatusCodes.Status415UnsupportedMediaType);
         group.MapGet("/consent", ConsentPromptAsync)
             .WithSummary("Returns what the consent page shows for a stored request.")
             .Produces<ConsentPromptBody>()
@@ -199,10 +217,18 @@ internal static partial class SessionEndpoints
 
         // A sealed value that does not open (changed, expired, or from another tenant) only loses the redirect.
         var target = protector.Unprotect(requestContext.Tenant.Id, body?.LogoutRequest);
-        var outcome = await logout.ConfirmAsync(requestContext, context.Request.Cookies[SessionCookie], target, context.RequestAborted)
+        // A sid of the wrong form names no session. It must not turn into "every account".
+        if (body?.Sid is { } sid && !SessionSid.IsValid(sid))
+        {
+            LogRefused(logger, "sid malformed");
+            return Error(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+
+        var outcome = await logout.ConfirmAsync(requestContext, context.Request.Cookies[SessionCookie], target, body?.Sid, context.RequestAborted)
             .ConfigureAwait(false);
 
-        context.Response.Cookies.Delete(SessionCookie, SessionCookieOptions());
+        // The cookie stays: an ended session ID authenticates nothing, and the picker shows the account as "Signed out"
+        // until the user forgets it (D55).
         var location = outcome is LogoutRedirect redirect ? LogoutEndpoint.RedirectLocation(redirect) : LogoutEndpoint.SignedOutLocation(ui.Value);
         return Results.Json(new LogoutResultBody(location), Json);
     }
@@ -221,6 +247,116 @@ internal static partial class SessionEndpoints
             : Results.Json(
                 new MeBody(valid.User.Id.ToString(), valid.User.Email, valid.Session.AuthTime.ToUnixTimeSeconds()),
                 Json);
+    }
+
+    /// <summary>
+    /// The accounts of this browser, for the account picker and the sign-in page (D55). Same origin only: Heimdall sends
+    /// no CORS headers, so no other site can read the list.
+    /// </summary>
+    private static async Task<IResult> AccountsAsync(HttpContext context, AuthorizationService authorization)
+    {
+        OAuthResponses.NoStore(context.Response);
+        var requestId = context.Request.Query["request_id"];
+        var list = await authorization.ListAccountsAsync(
+            TenantResolutionMiddleware.GetRequestContext(context),
+            requestId.Count == 1 ? requestId.ToString() : null,
+            context.Request.Cookies[SessionCookie],
+            context.RequestAborted).ConfigureAwait(false);
+
+        return Results.Json(
+            new AccountsBody(
+                [.. list.Accounts.Select(a => new AccountBody(a.Sid, a.Email, a.SignedIn ? "signed_in" : "signed_out"))],
+                list.Accounts.Count(a => a.SignedIn) < SessionList.MaxSessions,
+                list.ClientName,
+                list.LoginHint,
+                list.SignInSid),
+            Json);
+    }
+
+    /// <summary>
+    /// Records the account that the user chose on the account picker (D52). The same CSRF checks as login apply: a
+    /// cross-site page must not choose the account.
+    /// </summary>
+    private static async Task<IResult> SelectAsync(HttpContext context, IAntiforgery antiforgery, AuthorizationService authorization, ILoggerFactory loggers)
+    {
+        var logger = loggers.CreateLogger(typeof(SessionEndpoints));
+        OAuthResponses.NoStore(context.Response);
+
+        if (await RefuseBrowserRequestAsync(context, antiforgery, logger).ConfigureAwait(false) is { } refused)
+        {
+            return refused;
+        }
+
+        SelectBody? body;
+        try
+        {
+            body = await context.Request.ReadFromJsonAsync<SelectBody>(Json, context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is JsonException or BadHttpRequestException)
+        {
+            LogRefused(logger, "malformed or oversized body");
+            return Error(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+
+        var result = await authorization.SelectAsync(
+            TenantResolutionMiddleware.GetRequestContext(context),
+            body?.RequestId,
+            context.Request.Cookies[SessionCookie],
+            body?.Sid,
+            context.RequestAborted).ConfigureAwait(false);
+        if (!result.IsSuccess)
+        {
+            // The reason goes to the log only (D5).
+            LogRefused(logger, result.Error.AuditDetail);
+            return Error(StatusCodes.Status400BadRequest, result.Error.Code);
+        }
+
+        return Results.NoContent();
+    }
+
+    /// <summary>Removes one signed-out account from the browser's session list ("Forget", D55).</summary>
+    private static async Task<IResult> ForgetAsync(HttpContext context, IAntiforgery antiforgery, SessionService sessions, ILoggerFactory loggers)
+    {
+        var logger = loggers.CreateLogger(typeof(SessionEndpoints));
+        OAuthResponses.NoStore(context.Response);
+
+        if (await RefuseBrowserRequestAsync(context, antiforgery, logger).ConfigureAwait(false) is { } refused)
+        {
+            return refused;
+        }
+
+        ForgetBody? body;
+        try
+        {
+            body = await context.Request.ReadFromJsonAsync<ForgetBody>(Json, context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is JsonException or BadHttpRequestException)
+        {
+            LogRefused(logger, "malformed or oversized body");
+            return Error(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+
+        var cookie = await sessions.ForgetAsync(
+            TenantResolutionMiddleware.GetRequestContext(context),
+            context.Request.Cookies[SessionCookie],
+            body?.Sid,
+            context.RequestAborted).ConfigureAwait(false);
+        if (cookie is null)
+        {
+            LogRefused(logger, "no signed-out account with this sid");
+            return Error(StatusCodes.Status400BadRequest, "invalid_request");
+        }
+
+        if (cookie.Length == 0)
+        {
+            context.Response.Cookies.Delete(SessionCookie, SessionCookieOptions());
+        }
+        else
+        {
+            context.Response.Cookies.Append(SessionCookie, cookie, SessionCookieOptions());
+        }
+
+        return Results.NoContent();
     }
 
     /// <summary>What the consent page shows for a stored request. Same origin only: Heimdall sends no CORS headers.</summary>
@@ -375,7 +511,27 @@ internal static partial class SessionEndpoints
         [property: JsonPropertyName("scopes")] IReadOnlyList<string> Scopes,
         [property: JsonPropertyName("redirect_host")] string RedirectHost);
 
-    private sealed record LogoutBody([property: JsonPropertyName("logout_request")] string? LogoutRequest);
+    private sealed record LogoutBody(
+        [property: JsonPropertyName("logout_request")] string? LogoutRequest,
+        [property: JsonPropertyName("sid")] string? Sid);
+
+    private sealed record SelectBody(
+        [property: JsonPropertyName("request_id")] string? RequestId,
+        [property: JsonPropertyName("sid")] string? Sid);
+
+    private sealed record ForgetBody([property: JsonPropertyName("sid")] string? Sid);
+
+    private sealed record AccountBody(
+        [property: JsonPropertyName("sid")] string Sid,
+        [property: JsonPropertyName("email")] string Email,
+        [property: JsonPropertyName("state")] string State);
+
+    private sealed record AccountsBody(
+        [property: JsonPropertyName("accounts")] IReadOnlyList<AccountBody> Accounts,
+        [property: JsonPropertyName("can_add")] bool CanAdd,
+        [property: JsonPropertyName("client_name")] string? ClientName,
+        [property: JsonPropertyName("login_hint")] string? LoginHint,
+        [property: JsonPropertyName("sign_in_sid")] string? SignInSid);
 
     private sealed record LogoutResultBody([property: JsonPropertyName("redirect_to")] string RedirectTo);
 

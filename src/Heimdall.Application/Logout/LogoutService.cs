@@ -137,27 +137,30 @@ public sealed class LogoutService
         }
 
         // D31: at once only when the hint names a live session of this browser. An older hint of the same user does
-        // not count.
-        var hintMatches = hint is not null
-            && live.Any(l => string.Equals(hint.Sid, l.Session.Sid, StringComparison.Ordinal)
+        // not count. Only that session ends. The other accounts of the browser stay signed in.
+        var named = hint is null
+            ? null
+            : live.FirstOrDefault(l => string.Equals(hint.Sid, l.Session.Sid, StringComparison.Ordinal)
                 && string.Equals(hint.Subject, l.User.Id.ToString(), StringComparison.Ordinal));
-        if (!hintMatches)
+        if (named is null)
         {
             return new LogoutConfirm(target);
         }
 
-        await EndAllAsync(context, live, ReasonRpInitiated, client!.ClientId, cancellationToken).ConfigureAwait(false);
+        await EndAsync(context, named.Session, ReasonRpInitiated, client!.ClientId, cancellationToken).ConfigureAwait(false);
         return Finish(target);
     }
 
     /// <summary>
-    /// The user confirmed on the Heimdall page. Ends the browser's session, if it has one, then checks the target again:
-    /// an admin can disable the client or remove the URI while the page is open.
+    /// The user confirmed on the Heimdall page. Ends one account of the browser's session list, or every account,
+    /// then checks the target again: an admin can disable the client or remove the URI while the page is open.
     /// </summary>
+    /// <param name="sid">The <c>sid</c> of the one session to end, or null to end every live session of the list.</param>
     public async Task<LogoutOutcome> ConfirmAsync(
         RequestContext context,
         string? sessionId,
         LogoutTarget? target,
+        string? sid,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(context);
@@ -172,7 +175,14 @@ public sealed class LogoutService
             }
         }
 
+        // The page names one account by its sid, or none for every account. A sid selects only inside the list that
+        // the cookie authenticated (D29). A sid that names no live session of the list ends nothing.
         var live = await LiveSessionsAsync(context, sessionId, cancellationToken).ConfigureAwait(false);
+        if (sid is not null)
+        {
+            live = live.Where(l => string.Equals(l.Session.Sid, sid, StringComparison.Ordinal)).ToList();
+        }
+
         await EndAllAsync(context, live, ReasonUserConfirmed, target is null ? null : client!.ClientId, cancellationToken).ConfigureAwait(false);
 
         return Finish(target);
@@ -182,9 +192,8 @@ public sealed class LogoutService
         (await _sessions.ListAsync(context, cookie, cancellationToken).ConfigureAwait(false)).Where(l => l.Live).ToList();
 
     /// <summary>
-    /// Ends every live session of the browser's session list. The caller deletes the cookie after a sign-out, so no
-    /// session may stay live behind it. Each session ends in its own transaction (D33). Sign-out of one account of
-    /// several comes with the account picker (#41, step 3).
+    /// Ends these sessions of the browser's session list. Each session ends in its own transaction (D33), so a
+    /// failure in the middle leaves each session either ended with its families, or untouched.
     /// </summary>
     private async Task EndAllAsync(RequestContext context, List<ListedSession> live, string reason, string? clientId, CancellationToken cancellationToken)
     {

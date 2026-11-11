@@ -97,13 +97,8 @@ internal static partial class LogoutEndpoint
         var response = context.Response;
         OAuthResponses.NoStore(response);
 
-        // After a redirect or the signed-out page, the session is ended or was absent, so the cookie goes too. It stays
-        // while the user must confirm, and after an error, which ends nothing.
-        if (outcome is LogoutRedirect or LogoutSignedOut)
-        {
-            response.Cookies.Delete(SessionEndpoints.SessionCookie, SessionEndpoints.SessionCookieOptions());
-        }
-
+        // The cookie stays in every case. After a sign-out it holds the ID of an ended session, which authenticates
+        // nothing. The account picker shows that account as "Signed out" until the user forgets it (D55).
         response.StatusCode = StatusCodes.Status302Found;
         response.Headers.Location = outcome switch
         {

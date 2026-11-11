@@ -413,4 +413,38 @@ public class SessionServiceTests
         Assert.Equal(saves + 1, _sessions.SaveCount);
         Assert.Equal(Now.AddMinutes(1), _sessions.Sessions[0].LastSeenAt);
     }
+
+    [Fact]
+    public async Task Forget_removes_an_ended_session_from_the_list()
+    {
+        AddUser("bob@example.com");
+        var alice = await SignIn();
+        var both = await SignIn(existing: alice.Cookie, email: "bob@example.com");
+        _sessions.Sessions[0].Revoke(Now);
+
+        var cookie = await _service.ForgetAsync(Context, both.Cookie, _sessions.Sessions[0].Sid, CancellationToken.None);
+
+        Assert.Equal(both.SessionId, cookie);
+    }
+
+    [Fact]
+    public async Task Forget_of_the_last_entry_gives_an_empty_list()
+    {
+        var alice = await SignIn();
+        _sessions.Sessions[0].Revoke(Now);
+
+        Assert.Equal(string.Empty, await _service.ForgetAsync(Context, alice.Cookie, _sessions.Sessions[0].Sid, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Forget_refuses_a_live_session_and_an_unknown_sid()
+    {
+        // A forgotten live session would stay live with no browser that holds its ID.
+        var alice = await SignIn();
+
+        Assert.Null(await _service.ForgetAsync(Context, alice.Cookie, _sessions.Sessions[0].Sid, CancellationToken.None));
+        Assert.Null(await _service.ForgetAsync(Context, alice.Cookie, "sid-of-nobody-00000000", CancellationToken.None));
+        Assert.Null(await _service.ForgetAsync(Context, alice.Cookie, null, CancellationToken.None));
+        Assert.Null(await _service.ForgetAsync(Context, null, _sessions.Sessions[0].Sid, CancellationToken.None));
+    }
 }

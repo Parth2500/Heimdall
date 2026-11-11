@@ -2,6 +2,7 @@ using System.Buffers.Text;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using Heimdall.Domain.Audit;
 using Heimdall.Infrastructure.Persistence;
 using Microsoft.AspNetCore.WebUtilities;
@@ -452,5 +453,85 @@ public sealed class AuthorizeEndpointTests
         // No session in the list: nothing to pick from, so the sign-in page.
         QueryOf(response, out var path);
         Assert.Equal("/account/login", path);
+    }
+
+    private static async Task<JsonElement> AccountsAsync(Setup setup, string requestId)
+    {
+        using var response = await setup.Browser.AccountsAsync(requestId);
+        return JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.Clone();
+    }
+
+    private static string SidOf(JsonElement accounts, string email) =>
+        accounts.GetProperty("accounts").EnumerateArray().Single(a => a.GetProperty("email").GetString() == email).GetProperty("sid").GetString()!;
+
+    [DockerFact]
+    public async Task Picker_selection_gives_the_code_for_the_chosen_account()
+    {
+        await using var setup = await SetUpAsync();
+        await AddBobAsync(setup);
+        using var first = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("login_hint", "carol@example.com"), ("prompt", "select_account")));
+        var requestId = QueryOf(first, out _)["request_id"];
+        var accounts = await AccountsAsync(setup, requestId);
+        Assert.Equal("carol@example.com", accounts.GetProperty("login_hint").GetString());
+        Assert.False(string.IsNullOrEmpty(accounts.GetProperty("client_name").GetString()));
+
+        using var noXsrf = await setup.Browser.SelectAsync(requestId, SidOf(accounts, Email), withXsrf: false);
+        Assert.Equal(HttpStatusCode.Forbidden, noXsrf.StatusCode);
+        using var stillPicker = await setup.Browser.SendAsync(HttpMethod.Get, $"oauth/v1/authorize/resume?request_id={requestId}");
+        QueryOf(stillPicker, out var path);
+        Assert.Equal("/account/select-account", path);
+
+        using var select = await setup.Browser.SelectAsync(requestId, SidOf(accounts, Email));
+        Assert.Equal(HttpStatusCode.NoContent, select.StatusCode);
+        using var resumed = await setup.Browser.SendAsync(HttpMethod.Get, $"oauth/v1/authorize/resume?request_id={requestId}");
+
+        Assert.Equal(Email, await CodeEmailAsync(setup, QueryOf(resumed, out _)["code"]));
+        await using var scope = setup.Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<TenantScope>().Set(setup.Tenant.Tenant.Id);
+        var db = scope.ServiceProvider.GetRequiredService<HeimdallDbContext>();
+        Assert.True(await db.AuditEvents.AnyAsync(e => e.TenantId == setup.Tenant.Tenant.Id && e.Type == AuditEventTypes.AccountSelected));
+    }
+
+    [DockerFact]
+    public async Task Selection_of_a_sid_that_this_browser_does_not_hold_is_refused()
+    {
+        await using var setup = await SetUpAsync();
+        await AddBobAsync(setup);
+        using var first = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl());
+        var requestId = QueryOf(first, out _)["request_id"];
+        var bobSid = SidOf(await AccountsAsync(setup, requestId), "bob@example.com");
+
+        // Another browser holds only Alice's session. It names Bob's sid for the same request.
+        using var other = new BrowserSession(setup.Api, setup.Tenant.Host);
+        using var login = await other.LoginAsync(Email, Password);
+        using var select = await other.SelectAsync(requestId, bobSid);
+
+        Assert.Equal(HttpStatusCode.BadRequest, select.StatusCode);
+        using var resumed = await other.SendAsync(HttpMethod.Get, $"oauth/v1/authorize/resume?request_id={requestId}");
+
+        // That browser gets a code only for its own account, never for Bob.
+        Assert.Equal(Email, await CodeEmailAsync(setup, QueryOf(resumed, out _)["code"]));
+    }
+
+    [DockerFact]
+    public async Task Selected_account_that_must_sign_in_again_is_named_for_the_sign_in_page()
+    {
+        await using var setup = await SetUpAsync();
+        await AddBobAsync(setup);
+        using var first = await setup.Browser.SendAsync(HttpMethod.Get, AuthorizeUrl(("max_age", "60")));
+        var requestId = QueryOf(first, out _)["request_id"];
+        var aliceSid = SidOf(await AccountsAsync(setup, requestId), Email);
+        using var select = await setup.Browser.SelectAsync(requestId, aliceSid);
+        setup.Api.Time.Advance(TimeSpan.FromSeconds(90));
+
+        using var resumed = await setup.Browser.SendAsync(HttpMethod.Get, $"oauth/v1/authorize/resume?request_id={requestId}");
+        QueryOf(resumed, out var path);
+        Assert.Equal("/account/login", path);
+        Assert.Equal(aliceSid, (await AccountsAsync(setup, requestId)).GetProperty("sign_in_sid").GetString());
+
+        // The sign-in keeps the sid (D13), so the selection still names the session.
+        using var again = await setup.Browser.LoginAsync(Email, Password);
+        using var done = await setup.Browser.SendAsync(HttpMethod.Get, $"oauth/v1/authorize/resume?request_id={requestId}");
+        Assert.Equal(Email, await CodeEmailAsync(setup, QueryOf(done, out _)["code"]));
     }
 }

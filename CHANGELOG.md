@@ -12,6 +12,9 @@ This file lists the changes that matter to a client developer or an operator. Th
 - Changed: a second sign-in of the same user in the same browser keeps the session and its `sid`. The ID token of the next sign-in has the same `sid` and a new `auth_time`. Before, the second sign-in started a new session, and a later sign-out did not revoke the token families of the first one (D13, DR-013).
 - Added: `prompt=select_account`, `login_hint`, and `id_token_hint` at `/authorize` and `/par` (D51 to D54). With several accounts in the browser and no hint, Heimdall sends the user to the account picker. With `prompt=none`, the client gets `account_selection_required`.
 - Changed: an `id_token_hint` that Heimdall cannot verify for the client is `invalid_request`. Before, `/authorize` ignored the parameter.
+- Changed: RP-initiated logout ends only the account that the `id_token_hint` names. Other accounts in the same browser stay signed in (D31, DR-014).
+- Changed: a sign-out keeps the session cookie. The account picker shows the account as "Signed out" until the user forgets it (D33, D55, DR-014).
+- Added: the session API endpoints `/session/v1/accounts`, `/session/v1/select`, and `/session/v1/forget`. `/session/v1/logout` takes a `sid` to end one account.
 - Added: the audit event `account.selected`.
 - Added: the audit event `session.reauthenticated`, and the login API error `session_limit` (HTTP 409).
 - Changed: dependency updates: Angular 22.2.4, vitest 5.1.0, OpenTelemetry instrumentation 1.20.2, Scalar 2.19.0, CsCheck 5.0.1, base images, and CI actions.

@@ -7,7 +7,7 @@ Sign-out has three parts. Heimdall supports all three.
 | Part | What ends | How |
 |---|---|---|
 | Your app's session | The user's session in your app. | Your app ends it. |
-| The Heimdall session | The user's session at Heimdall, for every app on this browser. | Send the browser to the `end_session_endpoint` (RP-Initiated Logout 1.0). |
+| The Heimdall session | The session of one account at Heimdall, for every app on this browser. A browser can hold several accounts. Your sign-out ends only the account of your ID token. | Send the browser to the `end_session_endpoint` (RP-Initiated Logout 1.0). |
 | The tokens of that sign-in | Every refresh token family of the Heimdall session, for every app. | Heimdall revokes them when the session ends. |
 
 A sign-out at Heimdall also tells the servers of the other apps in the session, if they registered a `backchannel_logout_uri` (Back-Channel Logout 1.0).
@@ -50,7 +50,7 @@ Why the confirmation: another site can send a browser to this endpoint. Without 
 
 ### What ends
 
-- The Heimdall session. The next sign-in asks for the password.
+- The Heimdall session of that account. The next sign-in asks for the password. Heimdall's account picker still shows the account as "Signed out", until the user removes it.
 - Every refresh token family of that session, for every app, also with `offline_access`. A refresh then gets `invalid_grant`. This is stricter than Back-Channel Logout 1.0, section 2.7, which keeps `offline_access` tokens.
 - Access tokens stay valid until `exp` (5 minutes by default) for a resource server that checks them offline. Heimdall cannot recall a JWT. Heimdall's `/userinfo` refuses them at once. A resource server that uses introspection sees the sign-out at once (see [Validate access tokens](validate-access-tokens.md#revocation-and-logout)).
 

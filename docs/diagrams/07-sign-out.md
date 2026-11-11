@@ -21,7 +21,7 @@ sequenceDiagram
         H->>B: 302 to the URI with state, or the signed-out page
     else Hint sid = this session's sid (D31)
         H->>DB: One transaction: end the session, revoke its families, queue the logouts (D33)
-        H->>B: 302 to the URI with state. Delete the cookie.
+        H->>B: 302 to the URI with state. The cookie stays (D55).
     else Any other request (no hint, an old hint, a forged hint)
         H->>B: 302 /account/logout?logout_request=sealed target (U17)
         B->>P: GET /account/logout
@@ -29,7 +29,7 @@ sequenceDiagram
         B->>H: POST /session/v1/logout {logout_request} with antiforgery, Origin, JSON
         H->>H: Open the sealed value. Check the client and the URI again.
         H->>DB: The same transaction (D33)
-        H->>B: 200 {redirect_to}. Delete the cookie.
+        H->>B: 200 {redirect_to}. The cookie stays (D55).
         B->>C: GET the URI with state, or the signed-out page
     end
 ```

@@ -266,7 +266,7 @@ public sealed class SessionEndpointTests
     }
 
     [DockerFact]
-    public async Task Logout_ends_the_session_and_deletes_the_cookie()
+    public async Task Logout_ends_the_session_and_keeps_the_cookie_for_the_signed_out_row()
     {
         var (api, tenant) = await SetUpAsync();
         await using var _ = api;
@@ -277,11 +277,163 @@ public sealed class SessionEndpointTests
         using var logout = await browser.LogoutAsync();
 
         Assert.Equal(HttpStatusCode.OK, logout.StatusCode);
-        Assert.Null(browser.SessionId);
+
+        // D55: the ended session ID stays in the cookie. It authenticates nothing.
+        Assert.Equal(id, browser.SessionId);
+        using var own = await browser.MeAsync();
+        Assert.Equal(HttpStatusCode.Unauthorized, own.StatusCode);
         using var replay = new BrowserSession(api, tenant.Host);
         replay.Cookies[SessionEndpoints.SessionCookie] = id;
         using var me = await replay.MeAsync();
         Assert.Equal(HttpStatusCode.Unauthorized, me.StatusCode);
+    }
+
+    // ---- The account list of the browser (#41, D55)
+
+    private static async Task<JsonElement> AccountsAsync(BrowserSession browser, string? requestId = null)
+    {
+        using var response = await browser.AccountsAsync(requestId);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.True(response.Headers.CacheControl?.NoStore);
+        Assert.False(response.Headers.Contains("Access-Control-Allow-Origin"));
+        return JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.Clone();
+    }
+
+    private static List<(string Email, string State, string Sid)> Rows(JsonElement accounts) =>
+        [.. accounts.GetProperty("accounts").EnumerateArray().Select(a =>
+            (a.GetProperty("email").GetString()!, a.GetProperty("state").GetString()!, a.GetProperty("sid").GetString()!))];
+
+    private async Task<(HeimdallApiFactory Api, TestTenant Tenant, BrowserSession Browser)> TwoAccountsAsync()
+    {
+        var (api, tenant) = await SetUpAsync();
+        await api.AddUserAsync(tenant, "bob@example.com", Password);
+        var browser = new BrowserSession(api, tenant.Host);
+        using var alice = await browser.LoginAsync(Email, Password);
+        using var bob = await browser.LoginAsync("bob@example.com", Password);
+        return (api, tenant, browser);
+    }
+
+    [DockerFact]
+    public async Task Accounts_lists_the_sessions_of_the_browser_and_no_secret()
+    {
+        var (api, tenant, browser) = await TwoAccountsAsync();
+        await using var _ = api;
+        using var __ = browser;
+
+        using var response = await browser.AccountsAsync();
+        var text = await response.Content.ReadAsStringAsync();
+        var accounts = await AccountsAsync(browser);
+
+        var rows = Rows(accounts);
+        Assert.Equal([(Email, "signed_in"), ("bob@example.com", "signed_in")], rows.Select(r => (r.Email, r.State)));
+        Assert.Equal((await SessionsAsync(api, tenant)).Select(s => s.Sid), rows.Select(r => r.Sid));
+        Assert.True(accounts.GetProperty("can_add").GetBoolean());
+        Assert.False(accounts.TryGetProperty("client_name", out var _));
+
+        // The page gets the public sid, never a session ID of the cookie.
+        Assert.All(browser.SessionId!.Split('.'), id => Assert.DoesNotContain(id, text, StringComparison.Ordinal));
+    }
+
+    [DockerFact]
+    public async Task Accounts_without_a_cookie_is_an_empty_list()
+    {
+        var (api, tenant) = await SetUpAsync();
+        await using var _ = api;
+        using var browser = new BrowserSession(api, tenant.Host);
+
+        var accounts = await AccountsAsync(browser);
+
+        Assert.Empty(Rows(accounts));
+        Assert.True(accounts.GetProperty("can_add").GetBoolean());
+    }
+
+    [DockerFact]
+    public async Task Sign_out_of_one_account_keeps_the_other_signed_in()
+    {
+        var (api, tenant, browser) = await TwoAccountsAsync();
+        await using var _ = api;
+        using var __ = browser;
+        var cookie = browser.SessionId;
+        var bobSid = Rows(await AccountsAsync(browser))[1].Sid;
+
+        using var logout = await browser.LogoutAsync(bobSid);
+
+        Assert.Equal(HttpStatusCode.OK, logout.StatusCode);
+        Assert.Equal(cookie, browser.SessionId);
+        Assert.Equal([(Email, "signed_in"), ("bob@example.com", "signed_out")], Rows(await AccountsAsync(browser)).Select(r => (r.Email, r.State)));
+        using var me = await browser.MeAsync();
+        using var json = JsonDocument.Parse(await me.Content.ReadAsStringAsync());
+        Assert.Equal(Email, json.RootElement.GetProperty("email").GetString());
+    }
+
+    [DockerFact]
+    public async Task Sign_out_without_a_sid_ends_every_account()
+    {
+        var (api, tenant, browser) = await TwoAccountsAsync();
+        await using var _ = api;
+        using var __ = browser;
+
+        using var logout = await browser.LogoutAsync();
+
+        Assert.All(Rows(await AccountsAsync(browser)), r => Assert.Equal("signed_out", r.State));
+        Assert.All(await SessionsAsync(api, tenant), s => Assert.NotNull(s.RevokedAt));
+    }
+
+    [DockerFact]
+    public async Task Sign_out_with_a_malformed_sid_ends_nothing()
+    {
+        // A sid of the wrong form must not turn into "every account".
+        var (api, tenant, browser) = await TwoAccountsAsync();
+        await using var _ = api;
+        using var __ = browser;
+
+        using var logout = await browser.LogoutAsync("x");
+
+        Assert.Equal(HttpStatusCode.BadRequest, logout.StatusCode);
+        Assert.All(await SessionsAsync(api, tenant), s => Assert.Null(s.RevokedAt));
+    }
+
+    [DockerFact]
+    public async Task Forget_removes_a_signed_out_account_from_the_cookie()
+    {
+        var (api, tenant, browser) = await TwoAccountsAsync();
+        await using var _ = api;
+        using var __ = browser;
+        var ids = browser.SessionId!.Split('.');
+        var rows = Rows(await AccountsAsync(browser));
+        using var logout = await browser.LogoutAsync(rows[1].Sid);
+
+        using var live = await browser.ForgetAsync(rows[0].Sid);
+        using var noXsrf = await browser.ForgetAsync(rows[1].Sid, withXsrf: false);
+        Assert.Equal(HttpStatusCode.BadRequest, live.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, noXsrf.StatusCode);
+        Assert.Equal(string.Join('.', ids), browser.SessionId);
+
+        using var forget = await browser.ForgetAsync(rows[1].Sid);
+
+        Assert.Equal(HttpStatusCode.NoContent, forget.StatusCode);
+        Assert.Equal(ids[0], browser.SessionId);
+        var cookie = browser.LastSetCookies[SessionEndpoints.SessionCookie].ToLowerInvariant();
+        Assert.Contains("httponly", cookie, StringComparison.Ordinal);
+        Assert.Contains("secure", cookie, StringComparison.Ordinal);
+        Assert.Contains("samesite=lax", cookie, StringComparison.Ordinal);
+        Assert.Equal([Email], Rows(await AccountsAsync(browser)).Select(r => r.Email));
+    }
+
+    [DockerFact]
+    public async Task Forget_of_the_last_account_deletes_the_cookie()
+    {
+        var (api, tenant) = await SetUpAsync();
+        await using var _ = api;
+        using var browser = new BrowserSession(api, tenant.Host);
+        using var login = await browser.LoginAsync(Email, Password);
+        var sid = Rows(await AccountsAsync(browser))[0].Sid;
+        using var logout = await browser.LogoutAsync();
+
+        using var forget = await browser.ForgetAsync(sid);
+
+        Assert.Equal(HttpStatusCode.NoContent, forget.StatusCode);
+        Assert.Null(browser.SessionId);
     }
 
     [DockerFact]

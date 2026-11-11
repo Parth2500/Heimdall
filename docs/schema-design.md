@@ -1,6 +1,6 @@
 # Heimdall Schema Design (Phase 0)
 
-This document defines the PostgreSQL schema. It uses the terms in the glossary of `docs/threat-model.md`. Decision IDs (D1 to D54) refer to that document.
+This document defines the PostgreSQL schema. It uses the terms in the glossary of `docs/threat-model.md`. Decision IDs (D1 to D55) refer to that document.
 
 The document has no C# code. The entities and the migrations are written by hand, from this design.
 
