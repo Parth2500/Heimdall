@@ -65,6 +65,7 @@ Auth Code + PKCE (S256 mandatory for ALL clients, per OAuth 2.1), RS256 signing 
 DPoP (RFC 9449), PAR (RFC 9126), rate limiting on `/authorize`, `/token` and login, introspection (RFC 7662), RP-initiated logout and back-channel logout (#40), run the OpenID Foundation conformance suite and fix failures.
 
 **Phase 3, Breadth.**
+Order changed on 2026-11-14 (DR-015): after the account picker (#41), build registration, email verification, password reset and account recovery, for one shared tenant with open registration as a tenant setting. Heimdall is the sign-in service of the Asgard suite's online group (Huginn, and homes that link as public clients with a loopback redirect). It is not installed in homes: no lite profile, no second storage provider. Then the rest:
 Multi-tenancy features (portal, onboarding; the `Tenant` table and `TenantId` columns exist from the first migration, see D15-D21 in the threat model), WebAuthn/passkeys, admin portal with RBAC and an immutable audit log, persisted and revocable per-client/per-scope consent. Client experience modeled on Microsoft Entra ID (added 2026-10-22): account picker with `prompt=select_account` and several accounts in one browser (#41, changes the session model, design note first), an MSAL-like browser library over `oidc-client-ts` with redirect and popup sign-in (#42), a .NET package like `Microsoft.Identity.Web` (#43).
 
 **Phase 4, Ops.**

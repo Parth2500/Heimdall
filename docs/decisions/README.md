@@ -29,3 +29,4 @@ A decision record keeps the history. Each record is one change to a decision: wh
 | [DR-012](012-pnpm-replaces-npm.md) | 2026-10-31 | pnpm replaces npm for the Angular workspace |
 | [DR-013](013-several-sessions-in-one-browser.md) | 2026-11-12 | One browser holds several sessions (#41) |
 | [DR-014](014-sign-out-of-one-account.md) | 2026-11-12 | A sign-out ends one account and keeps the cookie (#41) |
+| [DR-015](015-account-features-first-in-phase-3.md) | 2026-11-14 | Phase 3 starts with account features, for one shared tenant |
