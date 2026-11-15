@@ -9,7 +9,7 @@
 # Outside Development the server refuses to start until a production key store exists (#34).
 
 # ---- Account pages (Angular) ----
-FROM docker.io/library/node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c AS ui
+FROM docker.io/library/node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS ui
 WORKDIR /repo/ui
 COPY ui/package.json ui/pnpm-lock.yaml ui/pnpm-workspace.yaml ./
 # pnpm at the version that the packageManager field in package.json names.
